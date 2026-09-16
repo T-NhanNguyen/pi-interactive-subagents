@@ -2109,7 +2109,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         if (unknownConfiguredNames.length > 0) {
           lines.push(
-            `⚠ models.agents names with no matching agent: ${unknownConfiguredNames.join(", ")}`,
+            `Warning: models.agents names with no matching agent: ${unknownConfiguredNames.join(", ")}`,
           );
         }
 
