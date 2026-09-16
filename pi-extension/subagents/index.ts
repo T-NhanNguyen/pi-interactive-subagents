@@ -876,6 +876,12 @@ function applySandboxToParts(
   // Default-deny: disable global extension discovery and re-enable only the
   // extensions backing the whitelisted tools. A null allowlist means the spawn
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  //
+  // Note for anyone fixing the provider-extension case (issue #12): a provider
+  // backs no tool, so it is missing from this whitelist and the child cannot
+  // resolve `--model`. Derive that provider from `effectiveModel` above, never
+  // from `loadout.model` — that field may hold the inherit token, which is not
+  // a model id.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
