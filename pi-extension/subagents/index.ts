@@ -55,6 +55,16 @@ import {
   loadStatusConfig,
 } from "./status.ts";
 import {
+  INHERIT_TOKEN,
+  formatModelSource,
+  loadSubagentConfig,
+  resolveLoadoutModel,
+  resolveSubagentModel,
+  writeModelSelection,
+  type ModelCatalog,
+  type ResolvedModel,
+} from "./config.ts";
+import {
   getSubagentActivityFile,
   readSubagentActivityFile,
   type ActivityReadResult,
@@ -835,10 +845,15 @@ function buildSubagentToolAllowlist(
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
+  opts: { artifactDir: string; name: string; model?: string | null; thinking?: string | null },
 ): void {
-  if (loadout.model) {
-    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
+  // `opts.model` overrides the snapshot for callers that re-resolve the inherit
+  // token. The token itself is never a model id, so it is never passed along.
+  const snapshotModel = opts.model !== undefined ? opts.model : loadout.model;
+  const effectiveModel = snapshotModel === INHERIT_TOKEN ? null : snapshotModel;
+  const effectiveThinking = opts.thinking !== undefined ? opts.thinking : loadout.thinking;
+  if (effectiveModel) {
+    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
     parts.push("--model", shellEscape(model));
   }
 
@@ -1130,6 +1145,8 @@ export const __test__ = {
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   applySandboxToParts,
+  formatAgentModelTag,
+  buildModelCatalog,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1160,6 +1177,64 @@ function startWidgetRefresh() {
 }
 
 /**
+ * Snapshot the session's model environment for resolution and validation.
+ *
+ * An absent context yields an empty catalogue, which disables validation rather
+ * than rejecting every configured model. A running pi always has at least one
+ * model with credentials, so an empty catalogue means "unknown", not "none".
+ */
+function buildModelCatalog(ctx: ExtensionContext | undefined): ModelCatalog {
+  const available = (ctx?.modelRegistry?.getAvailable() ?? []).map((model) => ({
+    provider: model.provider,
+    id: model.id,
+    name: model.name,
+  }));
+  return {
+    parentModel: ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
+    parentThinking: ctx?.thinkingLevel ?? null,
+    available,
+  };
+}
+
+/**
+ * Resolve a sub-agent's model: spawn parameter, then the config chain, then the
+ * agent frontmatter. Throws when the resolved model is unusable and
+ * `models.fallback` is `fail`.
+ */
+function resolveModelForSpawn(
+  params: typeof SubagentParams.static,
+  agentDefs: AgentDefaults | null,
+  ctx: ExtensionContext,
+): ResolvedModel {
+  const resolved = resolveSubagentModel({
+    param: params.model ?? null,
+    agentName: params.agent ?? null,
+    agentModel: agentDefs?.model ?? null,
+    agentThinking: agentDefs?.thinking ?? null,
+    config: loadSubagentConfig(),
+    catalog: buildModelCatalog(ctx),
+  });
+
+  if (resolved.error) throw new Error(resolved.error);
+  if (resolved.warning) ctx.ui.notify(resolved.warning, "warning");
+  return resolved;
+}
+
+/**
+ * Short model tag for `subagents_list`: the model that will really run, plus
+ * where it came from. Reports an unavailable model instead of hiding it.
+ */
+function formatAgentModelTag(resolved: ResolvedModel, agentModel: string | null): string {
+  if (resolved.command) {
+    return ` [${resolved.command} · ${formatModelSource(resolved.source)}]`;
+  }
+  if (resolved.error || resolved.warning) {
+    return ` [${agentModel ?? "model"} unavailable]`;
+  }
+  return "";
+}
+
+/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -1167,17 +1242,16 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: ExtensionContext,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = resolveModelForSpawn(params, agentDefs, ctx);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1257,8 +1331,8 @@ async function launchSubagent(
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+    if (effectiveModel.command) {
+      cmdParts.push("--model", shellEscape(effectiveModel.command));
     }
 
     const sp = agentDefs.body;
@@ -1341,8 +1415,8 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
-    model: effectiveModel ?? null,
-    thinking: effectiveThinking ?? null,
+    model: effectiveModel.token,
+    thinking: effectiveModel.thinking,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
@@ -1354,7 +1428,12 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, {
+    artifactDir,
+    name: params.name,
+    model: effectiveModel.command,
+    thinking: effectiveModel.thinking,
+  });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
@@ -1963,7 +2042,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
 
-      async execute() {
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
         const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
 
         if (list.length === 0) {
@@ -1973,16 +2052,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const lines = list.map((a) => {
+        // Show the model each agent will actually run on, not the raw
+        // frontmatter value, so a config override or an unavailable model is
+        // visible before anything is spawned.
+        const config = loadSubagentConfig();
+        const catalog = buildModelCatalog(ctx);
+        const agents = list.map((agent) => {
+          const resolved = resolveSubagentModel({
+            param: null,
+            agentName: agent.name,
+            agentModel: agent.model ?? null,
+            agentThinking: agent.thinking ?? null,
+            config,
+            catalog,
+          });
+          const modelTag = formatAgentModelTag(resolved, agent.model ?? null);
+          return {
+            ...agent,
+            effectiveModel: resolved.command,
+            modelSource: resolved.source,
+            modelInherited: resolved.inherited,
+            modelProblem: resolved.warning ?? resolved.error ?? null,
+            modelTag,
+          };
+        });
+
+        const lines = agents.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
+          return `• ${a.name}${badge}${a.modelTag}${desc}`;
         });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents },
         };
       },
 
@@ -1995,7 +2098,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+          const model = a.modelTag ? theme.fg("dim", a.modelTag) : "";
           return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
@@ -2149,6 +2252,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        // Re-resolve the model from the snapshot before creating a pane. An
+        // inherit token follows the session that is resuming; a literal model
+        // is re-checked against this installation. Refuse before we open a pane
+        // so a failure cannot leave an empty surface behind.
+        const resumeModel = resolveLoadoutModel({
+          loadout,
+          config: loadSubagentConfig(),
+          catalog: buildModelCatalog(ctx),
+        });
+        if (resumeModel.error) {
+          const err = `Cannot resume "${requestedName}": ${resumeModel.error}`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if (resumeModel.warning) ctx.ui.notify(resumeModel.warning, "warning");
+
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
@@ -2165,7 +2283,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         mkdirSync(dirname(activityFile), { recursive: true });
 
         // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
+        applySandboxToParts(parts, loadout, {
+          artifactDir,
+          name,
+          model: resumeModel.command,
+          thinking: resumeModel.thinking,
+        });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2318,6 +2441,61 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  // /subagent-model command — pick which model an agent runs on
+  pi.registerCommand("subagent-model", {
+    description: "Choose which model a sub-agent runs on (writes config.json)",
+    handler: async (_args, ctx) => {
+      const registry = ctx.modelRegistry;
+      if (!registry?.getAvailable) {
+        ctx.ui.notify("This pi build does not expose the model registry.", "error");
+        return;
+      }
+
+      const allLabel = "all agents (config default)";
+      const agentNames = discoverAgentDefinitions()
+        .filter((agent) => !agent.disableModelInvocation)
+        .map((agent) => agent.name)
+        .sort();
+
+      const target = await ctx.ui.select("Set the sub-agent model for:", [allLabel, ...agentNames]);
+      if (!target) return;
+
+      // Offer only models this installation can actually run, mirroring /models.
+      const modelIds = [
+        ...new Set(
+          registry
+            .getAvailable()
+            .filter((model) => !registry.hasConfiguredAuth || registry.hasConfiguredAuth(model))
+            .map((model) => `${model.provider}/${model.id}`),
+        ),
+      ].sort();
+
+      const resetLabel = "reset to the agent's own model";
+      const choice = await ctx.ui.select(`${target} — model:`, [
+        INHERIT_TOKEN,
+        resetLabel,
+        ...modelIds,
+      ]);
+      if (!choice) return;
+
+      const agentName = target === allLabel ? null : target;
+      const value = choice === resetLabel ? null : choice;
+
+      try {
+        const { path } = writeModelSelection({ agentName, value });
+        ctx.ui.notify(
+          value === null
+            ? `Cleared the model override for ${target}.`
+            : `Set ${target} to ${value}. Written to ${path}.`,
+          "info",
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Could not update the sub-agent config: ${message}`, "error");
+      }
+    },
+  });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {

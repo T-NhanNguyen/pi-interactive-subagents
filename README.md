@@ -163,6 +163,50 @@ subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipe
 
 Set a per-agent default with `cwd:` in frontmatter.
 
+## Model configuration
+
+A sub-agent model comes from the spawn `model` parameter, the `models` section of `config.json`, or the agent frontmatter, in that order. The `models` section is optional. Without it, models come from the agent frontmatter exactly as before.
+
+```json
+{
+  "status": { "enabled": true },
+  "models": {
+    "default": "inherit",
+    "thinking": "low",
+    "agents": {
+      "scout": { "model": "provider/model-id", "thinking": "low" },
+      "worker": { "model": "inherit" }
+    },
+    "validate": true,
+    "fallback": "inherit"
+  }
+}
+```
+
+| Key | Type | Default | Meaning |
+| --- | ---- | ------- | ------- |
+| `default` | string | none | Model for every agent without a per-agent entry. |
+| `thinking` | string | none | Thinking level for every agent. One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |
+| `agents` | object | `{}` | Per-agent `model` and `thinking` overrides, keyed by agent name. |
+| `validate` | boolean | `true` | Check the resolved model against the models this pi installation can run. |
+| `fallback` | string | `inherit` | Action when validation fails: `default`, `inherit`, or `fail`. |
+
+Resolution order, first match wins:
+
+| Priority | Source |
+| -------- | ------ |
+| 1 | The `model` parameter on the spawn call. |
+| 2 | `models.agents["<name>"].model`. |
+| 3 | `models.default`. |
+| 4 | The `model:` field in the agent frontmatter. |
+| 5 | The pi session default, when no model applies. |
+
+A value is a `provider/modelId` string, a bare `modelId`, or `inherit`. `inherit` runs the sub-agent on the parent session's active model and thinking level. The loadout snapshot stores the token `inherit` as it is, so a resumed sub-agent follows the model of the session that resumes it.
+
+A model that this installation cannot run follows `fallback`. With the default `inherit` the sub-agent still starts and the parent shows a warning. Set `fallback` to `fail` to refuse the spawn instead. Set `validate` to `false` to pass every model through unchanged.
+
+Use `/subagent-model` to pick a model for one agent or for all agents. The command writes `config.json` and keeps the `status` section. `subagents_list` shows the model each agent will use and where it came from.
+
 ## Status widget & configuration
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
@@ -171,7 +215,8 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ```json
 {
-  "status": { "enabled": true }
+  "status": { "enabled": true },
+  "models": { "agents": {} }
 }
 ```
 

@@ -45,6 +45,16 @@ import {
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
+  INHERIT_TOKEN,
+  parseSubagentConfig,
+  parseModelToken,
+  isModelAvailable,
+  resolveSubagentModel,
+  resolveLoadoutModel,
+  writeModelSelection,
+  type ModelCatalog,
+} from "../pi-extension/subagents/config.ts";
+import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -1062,6 +1072,262 @@ describe("status.ts", () => {
     assert.match(aggregate, /^Subagent status:/);
     assert.match(aggregate, /\+2 more running\./);
     assert.doesNotMatch(aggregate, /\/tmp|\.jsonl/);
+  });
+});
+
+describe("config.ts", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  /** Catalog helper: the first entry is the parent session's active model. */
+  function makeCatalog(entries: string[], parentThinking: string | null = "low"): ModelCatalog {
+    return {
+      parentModel: entries[0] ?? null,
+      parentThinking,
+      available: entries.map((entry) => {
+        const slash = entry.indexOf("/");
+        return { provider: entry.slice(0, slash), id: entry.slice(slash + 1) };
+      }),
+    };
+  }
+
+  it("treats a missing models section as no configuration", () => {
+    assert.deepEqual(parseSubagentConfig({ status: { enabled: true } }), { models: null });
+    assert.deepEqual(parseSubagentConfig({}), { models: null });
+  });
+
+  it("applies defaults inside an empty models section", () => {
+    assert.deepEqual(parseSubagentConfig({ models: { agents: {} } }), {
+      models: { agents: {}, validate: true, fallback: "inherit" },
+    });
+  });
+
+  it("accepts a thinking suffix on a model and keeps other colon ids intact", () => {
+    assert.deepEqual(parseModelToken("vendor/alpha:low"), {
+      base: "vendor/alpha",
+      thinking: "low",
+    });
+    assert.deepEqual(parseModelToken("vendor/beta-flash:batch"), {
+      base: "vendor/beta-flash:batch",
+      thinking: null,
+    });
+  });
+
+  it("rejects unsupported keys and invalid values", () => {
+    assert.throws(() => parseSubagentConfig({ models: { nope: 1 } }), /unsupported key/);
+    assert.throws(() => parseSubagentConfig({ models: { thinking: "extreme" } }), /models.thinking/);
+    assert.throws(() => parseSubagentConfig({ models: { fallback: "maybe" } }), /models.fallback/);
+    assert.throws(() => parseSubagentConfig({ models: { validate: "yes" } }), /boolean/);
+    assert.throws(
+      () => parseSubagentConfig({ models: { agents: { scout: { model: "  " } } } }),
+      /non-empty/,
+    );
+    assert.throws(
+      () => parseSubagentConfig({ models: { agents: { scout: { tool: "bash" } } } }),
+      /unsupported key/,
+    );
+  });
+
+  it("matches a model by provider/id or by bare id", () => {
+    const available = [{ provider: "vendor", id: "alpha" }];
+    assert.equal(isModelAvailable("vendor/alpha", available), true);
+    assert.equal(isModelAvailable("ALPHA", available), true);
+    assert.equal(isModelAvailable("vendor/other", available), false);
+  });
+
+  it("resolves param before config, config before frontmatter", () => {
+    const config = parseSubagentConfig({
+      models: {
+        default: "vendor/beta",
+        agents: { scout: { model: "vendor/alpha" } },
+      },
+    });
+    const catalog = makeCatalog([
+      "vendor/gamma",
+      "vendor/beta",
+      "vendor/alpha",
+      "vendor/from-file",
+    ]);
+    const base = {
+      agentName: "scout",
+      agentModel: "vendor/from-file",
+      agentThinking: "high",
+      config,
+      catalog,
+    };
+
+    assert.equal(resolveSubagentModel({ ...base, param: "vendor/gamma" }).source, "param");
+    assert.equal(resolveSubagentModel({ ...base, param: null }).source, "config-agent");
+    assert.equal(resolveSubagentModel({ ...base, param: null }).command, "vendor/alpha");
+
+    const noAgentEntry = parseSubagentConfig({ models: { default: "vendor/beta" } });
+    assert.equal(
+      resolveSubagentModel({ ...base, config: noAgentEntry, param: null }).source,
+      "config-default",
+    );
+
+    const noConfig = parseSubagentConfig({});
+    const fromFile = resolveSubagentModel({ ...base, config: noConfig, param: null });
+    assert.equal(fromFile.source, "agent");
+    assert.equal(fromFile.command, "vendor/from-file");
+    assert.equal(fromFile.thinking, "high");
+
+    const nothing = resolveSubagentModel({ ...base, agentModel: null, config: noConfig, param: null });
+    assert.equal(nothing.source, "unset");
+    assert.equal(nothing.command, null);
+  });
+
+  it("keeps the resolved command unchanged when no models section exists", () => {
+    // The non-invasive invariant: an absent section must not validate, warn, or
+    // rewrite anything, even when the model is absent from the catalogue.
+    const resolved = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: "vendor/beta",
+      agentThinking: "low",
+      config: parseSubagentConfig({}),
+      catalog: makeCatalog(["vendor/alpha"]),
+    });
+    assert.equal(resolved.command, "vendor/beta");
+    assert.equal(resolved.token, "vendor/beta");
+    assert.equal(resolved.warning, null);
+    assert.equal(resolved.error, null);
+  });
+
+  it("resolves the inherit token against the parent session", () => {
+    const config = parseSubagentConfig({ models: { agents: { scout: { model: INHERIT_TOKEN } } } });
+    const resolved = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: "vendor/beta",
+      agentThinking: "high",
+      config,
+      catalog: makeCatalog(["vendor/alpha"]),
+    });
+    // The token is what gets persisted; the command is what runs now.
+    assert.equal(resolved.token, INHERIT_TOKEN);
+    assert.equal(resolved.command, "vendor/alpha");
+    assert.equal(resolved.inherited, true);
+    assert.equal(resolved.thinking, "high", "an explicit thinking level still wins");
+  });
+
+  it("falls back in ladder order and refuses when the policy is fail", () => {
+    const config = parseSubagentConfig({
+      models: { default: "vendor/alpha", fallback: "default" },
+    });
+    // A spawn parameter outranks `models.default`, so the unavailable model wins
+    // the chain and the ladder has to run.
+    const fallback = resolveSubagentModel({
+      param: "vendor/missing",
+      agentName: null,
+      agentModel: null,
+      agentThinking: null,
+      config,
+      catalog: makeCatalog(["vendor/alpha"]),
+    });
+    assert.equal(fallback.command, "vendor/alpha");
+    assert.equal(fallback.source, "fallback");
+    assert.match(fallback.warning ?? "", /not available/);
+
+    const strict = parseSubagentConfig({ models: { fallback: "fail" } });
+    const failed = resolveSubagentModel({
+      param: "vendor/missing",
+      agentName: null,
+      agentModel: null,
+      agentThinking: null,
+      config: strict,
+      catalog: makeCatalog(["vendor/alpha"]),
+    });
+    assert.equal(failed.command, null);
+    assert.match(failed.error ?? "", /not available/);
+  });
+
+  it("re-resolves the inherit token when a snapshot is resumed", () => {
+    const config = parseSubagentConfig({ models: {} });
+    const loadout = { model: INHERIT_TOKEN, thinking: null, agent: "scout" };
+
+    const underA = resolveLoadoutModel({
+      loadout,
+      config,
+      catalog: makeCatalog(["vendor/alpha", "vendor/alpha"]),
+    });
+    const underB = resolveLoadoutModel({
+      loadout,
+      config,
+      catalog: makeCatalog(["vendor/gamma", "vendor/gamma"]),
+    });
+
+    assert.equal(underA.command, "vendor/alpha");
+    assert.equal(underB.command, "vendor/gamma");
+    assert.equal(underA.token, INHERIT_TOKEN, "the snapshot keeps the token");
+
+    // A literal snapshot replays unchanged.
+    const literal = resolveLoadoutModel({
+      loadout: { model: "vendor/alpha", thinking: "low", agent: null },
+      config,
+      catalog: makeCatalog(["vendor/alpha"]),
+    });
+    assert.equal(literal.command, "vendor/alpha");
+    assert.equal(literal.thinking, "low");
+  });
+
+  it("writes a selection, preserves other keys, and supports reset", () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-config-"));
+    try {
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2));
+
+      // No config.json yet: it is created from the example.
+      writeModelSelection({ agentName: "scout", value: INHERIT_TOKEN, configPath, examplePath });
+      writeModelSelection({
+        agentName: null,
+        value: "vendor/alpha",
+        configPath,
+        examplePath,
+      });
+
+      let parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.status, { enabled: true }, "status survives the write");
+      assert.equal(parsed.models.default, "vendor/alpha");
+      assert.deepEqual(parsed.models.agents, { scout: { model: INHERIT_TOKEN } });
+
+      // Reset removes only the agent entry.
+      writeModelSelection({ agentName: "scout", value: null, configPath, examplePath });
+      parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents, {});
+      assert.equal(parsed.models.default, "vendor/alpha");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an unsafe agent name instead of corrupting the config", () => {
+    assert.throws(
+      () => writeModelSelection({ agentName: "../escape", value: "inherit" }),
+      /unsafe agent name/,
+    );
+  });
+
+  it("formats a list tag that shows the effective model and its source", () => {
+    const tag = testApi.formatAgentModelTag(
+      { command: "vendor/alpha", source: "config-agent", warning: null, error: null },
+      "vendor/beta",
+    );
+    assert.equal(tag, " [vendor/alpha · config agent]");
+
+    const unavailable = testApi.formatAgentModelTag(
+      { command: null, source: "agent", warning: null, error: "nope" },
+      "vendor/missing",
+    );
+    assert.equal(unavailable, " [vendor/missing unavailable]");
+
+    assert.equal(
+      testApi.formatAgentModelTag(
+        { command: null, source: "unset", warning: null, error: null },
+        null,
+      ),
+      "",
+    );
   });
 });
 
