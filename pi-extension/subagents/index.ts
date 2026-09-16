@@ -63,6 +63,7 @@ import {
   writeModelSelection,
   type ModelCatalog,
   type ResolvedModel,
+  type SubagentConfig,
 } from "./config.ts";
 import {
   getSubagentActivityFile,
@@ -1146,7 +1147,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   formatAgentModelTag,
-  buildModelCatalog,
+  unknownConfiguredAgentNames,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1220,16 +1221,33 @@ function resolveModelForSpawn(
   return resolved;
 }
 
+/** Config agent names that match no discovered agent, sorted for display. */
+function unknownConfiguredAgentNames(
+  config: SubagentConfig,
+  knownNames: Iterable<string>,
+): string[] {
+  const known = new Set(knownNames);
+  return Object.keys(config.models?.agents ?? {})
+    .filter((name) => !known.has(name))
+    .sort();
+}
+
+/** Separator between a model id and its source in the `subagents_list` tag. */
+const MODEL_TAG_SEPARATOR = " · ";
+
+/** Stand-in when an unavailable model has no id to show. */
+const UNKNOWN_MODEL_LABEL = "model";
+
 /**
  * Short model tag for `subagents_list`: the model that will really run, plus
  * where it came from. Reports an unavailable model instead of hiding it.
  */
 function formatAgentModelTag(resolved: ResolvedModel, agentModel: string | null): string {
   if (resolved.command) {
-    return ` [${resolved.command} · ${formatModelSource(resolved.source)}]`;
+    return ` [${resolved.command}${MODEL_TAG_SEPARATOR}${formatModelSource(resolved.source)}]`;
   }
   if (resolved.error || resolved.warning) {
-    return ` [${agentModel ?? "model"} unavailable]`;
+    return ` [${agentModel ?? UNKNOWN_MODEL_LABEL} unavailable]`;
   }
   return "";
 }
@@ -2083,6 +2101,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return `• ${a.name}${badge}${a.modelTag}${desc}`;
         });
 
+        // A hand-edited config can name an agent that does not exist. Say so
+        // here instead of ignoring the entry silently.
+        const unknownConfiguredNames = unknownConfiguredAgentNames(
+          config,
+          list.map((agent) => agent.name),
+        );
+        if (unknownConfiguredNames.length > 0) {
+          lines.push(
+            `⚠ models.agents names with no matching agent: ${unknownConfiguredNames.join(", ")}`,
+          );
+        }
+
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: { agents },
@@ -2483,7 +2513,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const value = choice === resetLabel ? null : choice;
 
       try {
-        const { path } = writeModelSelection({ agentName, value });
+        const { path, changed } = writeModelSelection({ agentName, value });
+        if (!changed) {
+          ctx.ui.notify(`Nothing to clear for ${target} — no override is set.`, "info");
+          return;
+        }
         ctx.ui.notify(
           value === null
             ? `Cleared the model override for ${target}.`

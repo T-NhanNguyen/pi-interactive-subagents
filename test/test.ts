@@ -49,6 +49,8 @@ import {
   parseSubagentConfig,
   parseModelToken,
   isModelAvailable,
+  loadSubagentConfig,
+  formatModelSource,
   resolveSubagentModel,
   resolveLoadoutModel,
   writeModelSelection,
@@ -1090,6 +1092,18 @@ describe("config.ts", () => {
     };
   }
 
+  /** Temp config fixture: no test touches the real config.json. */
+  function withConfigFixture(
+    run: (paths: { configPath: string; examplePath: string }) => void,
+  ): void {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2));
+      run({ configPath, examplePath });
+    });
+  }
+
   it("treats a missing models section as no configuration", () => {
     assert.deepEqual(parseSubagentConfig({ status: { enabled: true } }), { models: null });
     assert.deepEqual(parseSubagentConfig({}), { models: null });
@@ -1271,20 +1285,22 @@ describe("config.ts", () => {
   });
 
   it("writes a selection, preserves other keys, and supports reset", () => {
-    const dir = mkdtempSync(join(tmpdir(), "subagent-config-"));
-    try {
-      const configPath = join(dir, "config.json");
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2));
-
+    withConfigFixture(({ configPath, examplePath }) => {
       // No config.json yet: it is created from the example.
-      writeModelSelection({ agentName: "scout", value: INHERIT_TOKEN, configPath, examplePath });
-      writeModelSelection({
+      const first = writeModelSelection({
+        agentName: "scout",
+        value: INHERIT_TOKEN,
+        configPath,
+        examplePath,
+      });
+      const second = writeModelSelection({
         agentName: null,
         value: "vendor/alpha",
         configPath,
         examplePath,
       });
+      assert.equal(first.changed, true);
+      assert.equal(second.changed, true);
 
       let parsed = JSON.parse(readFileSync(configPath, "utf8"));
       assert.deepEqual(parsed.status, { enabled: true }, "status survives the write");
@@ -1292,20 +1308,147 @@ describe("config.ts", () => {
       assert.deepEqual(parsed.models.agents, { scout: { model: INHERIT_TOKEN } });
 
       // Reset removes only the agent entry.
-      writeModelSelection({ agentName: "scout", value: null, configPath, examplePath });
+      const reset = writeModelSelection({
+        agentName: "scout",
+        value: null,
+        configPath,
+        examplePath,
+      });
+      assert.equal(reset.changed, true);
       parsed = JSON.parse(readFileSync(configPath, "utf8"));
       assert.deepEqual(parsed.models.agents, {});
       assert.equal(parsed.models.default, "vendor/alpha");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
-  it("rejects an unsafe agent name instead of corrupting the config", () => {
-    assert.throws(
-      () => writeModelSelection({ agentName: "../escape", value: "inherit" }),
-      /unsafe agent name/,
+  it("replaces a shorthand agent entry instead of throwing on it", () => {
+    // "scout": "inherit" is a plausible hand-written shorthand. Writing through
+    // the picker must repair the entry, not crash on a string primitive.
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(
+        configPath,
+        JSON.stringify({ models: { agents: { scout: INHERIT_TOKEN } } }, null, 2),
+      );
+
+      const result = writeModelSelection({
+        agentName: "scout",
+        value: "vendor/alpha",
+        configPath,
+        examplePath,
+      });
+
+      assert.equal(result.changed, true);
+      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents, { scout: { model: "vendor/alpha" } });
+    });
+  });
+
+  it("keeps unrelated keys of a repaired agent entry", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(
+        configPath,
+        JSON.stringify({ models: { agents: { scout: { thinking: "high" } } } }, null, 2),
+      );
+
+      writeModelSelection({ agentName: "scout", value: "vendor/alpha", configPath, examplePath });
+
+      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents.scout, { thinking: "high", model: "vendor/alpha" });
+    });
+  });
+
+  it("does not create a config file when there is nothing to reset", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+
+      const result = writeModelSelection({
+        agentName: "scout",
+        value: null,
+        configPath,
+        examplePath,
+      });
+
+      assert.equal(result.changed, false);
+      assert.equal(existsSync(configPath), false, "a reset must not create the file");
+    });
+  });
+
+  it("reports changed false when the entry to clear is already absent", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(configPath, JSON.stringify({ models: { agents: { worker: {} } } }, null, 2));
+      const before = readFileSync(configPath, "utf8");
+
+      const result = writeModelSelection({
+        agentName: "scout",
+        value: null,
+        configPath,
+        examplePath,
+      });
+
+      assert.equal(result.changed, false);
+      assert.equal(readFileSync(configPath, "utf8"), before, "a no-op reset must not rewrite");
+    });
+  });
+
+  it("rejects an unsafe agent name before touching the filesystem", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      assert.throws(
+        () => writeModelSelection({ agentName: "../escape", value: "inherit", configPath, examplePath }),
+        /unsafe agent name/,
+      );
+      assert.equal(existsSync(configPath), false, "the guard must run before the write");
+    });
+  });
+
+  it("names the offending file when the config JSON is broken", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(configPath, "{\n");
+      assert.throws(
+        () => writeModelSelection({ agentName: "scout", value: "vendor/alpha", configPath, examplePath }),
+        /Invalid JSON in subagent config .*config\.json/,
+      );
+    });
+  });
+
+  it("names the file in models validation errors", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, JSON.stringify({ models: { thinking: "extreme" } }));
+      assert.throws(
+        () => loadSubagentConfig(configPath, join(dir, "config.json.example")),
+        /Invalid subagent config in .*config\.json: models\.thinking/,
+      );
+    });
+  });
+
+  it("labels every resolution source", () => {
+    const sources = [
+      "param",
+      "config-agent",
+      "config-default",
+      "agent",
+      "snapshot",
+      "fallback",
+      "unset",
+    ] as const;
+    for (const source of sources) {
+      assert.equal(typeof formatModelSource(source), "string");
+      assert.notEqual(formatModelSource(source), "");
+    }
+    assert.equal(formatModelSource("config-agent"), "config agent");
+  });
+
+  it("lists config agent names that match no discovered agent", () => {
+    const config = parseSubagentConfig({
+      models: { agents: { scout: { model: "vendor/alpha" }, scaut: {}, worker: {} } },
+    });
+    assert.deepEqual(
+      testApi.unknownConfiguredAgentNames(config, ["scout", "worker", "researcher"]),
+      ["scaut"],
     );
+    assert.deepEqual(testApi.unknownConfiguredAgentNames({ models: null }, ["scout"]), []);
   });
 
   it("formats a list tag that shows the effective model and its source", () => {

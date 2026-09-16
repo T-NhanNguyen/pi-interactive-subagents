@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,11 +12,27 @@ import { fileURLToPath } from "node:url";
  * The `models` section is opt-in. When the key is absent, sub-agent models come
  * from the agent frontmatter exactly as before, so existing installations are
  * unaffected.
+ *
+ * This module also owns the shared config-file primitives — the validation
+ * guard, the raw JSON reader, and the file paths — so status.ts and the models
+ * parser cannot drift apart.
  */
 
-export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 export const SUBAGENT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 export const SUBAGENT_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+
+/** Default source label used when a caller has no file path at hand. */
+const DEFAULT_CONFIG_SOURCE = "config.json";
+
+/** Indent width for the config file this extension writes back. */
+const CONFIG_JSON_INDENT = 2;
+
+/** Agent names this extension accepts as config keys. */
+const AGENT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/** Keys that must never be written as agent names. */
+const FORBIDDEN_AGENT_NAMES = ["__proto__", "constructor"];
 
 /**
  * The literal that means "run this sub-agent on the parent session's active
@@ -26,7 +42,7 @@ export const SUBAGENT_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.exam
 export const INHERIT_TOKEN = "inherit";
 
 /** pi thinking levels, in ascending order. */
-export const THINKING_LEVELS = [
+const THINKING_LEVELS = [
   "off",
   "minimal",
   "low",
@@ -97,6 +113,17 @@ export type ModelSource =
   | "fallback"
   | "unset";
 
+/** Display label per resolution source, used by `subagents_list` and warnings. */
+const MODEL_SOURCE_LABELS: Record<ModelSource, string> = {
+  param: "spawn param",
+  "config-agent": "config agent",
+  "config-default": "config default",
+  agent: "agent file",
+  snapshot: "snapshot",
+  fallback: "fallback",
+  unset: "unset",
+};
+
 export interface ResolvedModel {
   /**
    * Value persisted in the loadout snapshot: a literal `provider/id`, the
@@ -117,119 +144,77 @@ export interface ResolvedModel {
   error: string | null;
 }
 
-function invalidConfig(source: string, message: string): never {
-  throw new Error(`Invalid subagent config in ${source}: ${message}`);
-}
-
-function requireObject(value: unknown, source: string, fieldName: string): Record<string, unknown> {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) {
-    invalidConfig(source, `${fieldName} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function rejectUnsupportedKeys(
-  value: Record<string, unknown>,
-  allowedKeys: readonly string[],
-  source: string,
-  fieldName: string,
-): void {
-  const unsupported = Object.keys(value).filter((key) => !allowedKeys.includes(key));
-  if (unsupported.length > 0) {
-    invalidConfig(source, `${fieldName} has unsupported key(s): ${unsupported.join(", ")}`);
-  }
-}
-
-function requireNonEmptyString(value: unknown, source: string, fieldName: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    invalidConfig(source, `${fieldName} must be a non-empty string`);
-  }
-  return value.trim();
-}
-
-function requireThinkingLevel(value: unknown, source: string, fieldName: string): ThinkingLevelName {
-  if (typeof value !== "string" || !THINKING_LEVEL_SET.has(value)) {
-    invalidConfig(
-      source,
-      `${fieldName} must be one of: ${THINKING_LEVELS.join(", ")}`,
-    );
-  }
-  return value as ThinkingLevelName;
-}
-
-function parseAgentModelConfig(
-  value: unknown,
-  source: string,
-  fieldName: string,
-): AgentModelConfig {
-  const entry = requireObject(value, source, fieldName);
-  rejectUnsupportedKeys(entry, ["model", "thinking"], source, fieldName);
-
-  const parsed: AgentModelConfig = {};
-  if (entry.model !== undefined) {
-    parsed.model = requireNonEmptyString(entry.model, source, `${fieldName}.model`);
-  }
-  if (entry.thinking !== undefined) {
-    parsed.thinking = requireThinkingLevel(entry.thinking, source, `${fieldName}.thinking`);
-  }
-  return parsed;
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
- * Parse the `models` section. Returns null when the key is absent, which is the
- * signal that no model configuration exists and resolution must stay inert.
+ * Validation primitives bound to one config file and one config label, so
+ * every section of the file rejects the same shapes and names the same file.
  */
-export function parseSubagentConfig(rawConfig: unknown, source = "config.json"): SubagentConfig {
-  const config = requireObject(rawConfig, source, "root");
-  if (config.models === undefined) return { models: null };
-
-  const models = requireObject(config.models, source, "models");
+export interface SubagentConfigGuard {
+  invalid(message: string): never;
+  isPlainObject(value: unknown): value is Record<string, unknown>;
+  requireObject(value: unknown, fieldName: string): Record<string, unknown>;
+  requireBoolean(value: unknown, fieldName: string): boolean;
+  requireNonEmptyString(value: unknown, fieldName: string): string;
   rejectUnsupportedKeys(
-    models,
-    ["default", "thinking", "agents", "validate", "fallback"],
-    source,
-    "models",
-  );
-
-  const parsed: ModelsConfig = {
-    agents: {},
-    validate: true,
-    fallback: "inherit",
-  };
-
-  if (models.default !== undefined) {
-    parsed.default = requireNonEmptyString(models.default, source, "models.default");
-  }
-  if (models.thinking !== undefined) {
-    parsed.thinking = requireThinkingLevel(models.thinking, source, "models.thinking");
-  }
-  if (models.validate !== undefined) {
-    if (typeof models.validate !== "boolean") {
-      invalidConfig(source, "models.validate must be a boolean");
-    }
-    parsed.validate = models.validate;
-  }
-  if (models.fallback !== undefined) {
-    if (models.fallback !== "default" && models.fallback !== "inherit" && models.fallback !== "fail") {
-      invalidConfig(source, "models.fallback must be one of: default, inherit, fail");
-    }
-    parsed.fallback = models.fallback;
-  }
-  if (models.agents !== undefined) {
-    const agents = requireObject(models.agents, source, "models.agents");
-    for (const [name, entry] of Object.entries(agents)) {
-      if (name === "__proto__" || name === "constructor") {
-        invalidConfig(source, `models.agents has unsupported key: ${name}`);
-      }
-      parsed.agents[name] = parseAgentModelConfig(entry, source, `models.agents.${name}`);
-    }
-  }
-
-  return { models: parsed };
+    value: Record<string, unknown>,
+    allowedKeys: readonly string[],
+    fieldName: string,
+  ): void;
 }
 
-/** Read the raw config text, preferring `config.json` over the shipped example. */
-export function readSubagentConfigText(
+/** Build the guard for one config file. `configLabel` names the section owner. */
+export function createSubagentConfigGuard(
+  source = DEFAULT_CONFIG_SOURCE,
+  configLabel = "subagent",
+): SubagentConfigGuard {
+  const invalid = (message: string): never => {
+    throw new Error(`Invalid ${configLabel} config in ${source}: ${message}`);
+  };
+
+  return {
+    invalid,
+    isPlainObject,
+    requireObject(value, fieldName) {
+      if (!isPlainObject(value)) invalid(`${fieldName} must be an object`);
+      return value;
+    },
+    requireBoolean(value, fieldName) {
+      if (typeof value !== "boolean") invalid(`${fieldName} must be a boolean`);
+      return value;
+    },
+    requireNonEmptyString(value, fieldName) {
+      if (typeof value !== "string" || value.trim().length === 0) {
+        invalid(`${fieldName} must be a non-empty string`);
+      }
+      return value.trim();
+    },
+    rejectUnsupportedKeys(value, allowedKeys, fieldName) {
+      const unsupported = Object.keys(value).filter((key) => !allowedKeys.includes(key));
+      if (unsupported.length > 0) {
+        invalid(`${fieldName} has unsupported key(s): ${unsupported.join(", ")}`);
+      }
+    },
+  };
+}
+
+/** Parse config JSON, naming the offending file on failure. */
+export function parseSubagentConfigJson(rawConfig: string, sourcePath: string): unknown {
+  try {
+    return JSON.parse(rawConfig) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
+  }
+}
+
+/**
+ * Read the raw config text, preferring `config.json` over the shipped example.
+ * Returns null when neither file exists.
+ */
+export function readSubagentConfigFile(
   configPath = SUBAGENT_CONFIG_PATH,
   examplePath = SUBAGENT_CONFIG_EXAMPLE_PATH,
 ): { sourcePath: string; rawConfig: string } | null {
@@ -247,6 +232,85 @@ export function readSubagentConfigText(
   }
 }
 
+function parseThinkingLevel(
+  guard: SubagentConfigGuard,
+  value: unknown,
+  fieldName: string,
+): ThinkingLevelName {
+  if (typeof value !== "string" || !THINKING_LEVEL_SET.has(value)) {
+    guard.invalid(`${fieldName} must be one of: ${THINKING_LEVELS.join(", ")}`);
+  }
+  return value as ThinkingLevelName;
+}
+
+function parseAgentModelConfig(
+  guard: SubagentConfigGuard,
+  value: unknown,
+  fieldName: string,
+): AgentModelConfig {
+  const entry = guard.requireObject(value, fieldName);
+  guard.rejectUnsupportedKeys(entry, ["model", "thinking"], fieldName);
+
+  const parsed: AgentModelConfig = {};
+  if (entry.model !== undefined) {
+    parsed.model = guard.requireNonEmptyString(entry.model, `${fieldName}.model`);
+  }
+  if (entry.thinking !== undefined) {
+    parsed.thinking = parseThinkingLevel(guard, entry.thinking, `${fieldName}.thinking`);
+  }
+  return parsed;
+}
+
+/**
+ * Parse the `models` section. Returns null when the key is absent, which is the
+ * signal that no model configuration exists and resolution must stay inert.
+ */
+export function parseSubagentConfig(rawConfig: unknown, source = DEFAULT_CONFIG_SOURCE): SubagentConfig {
+  const guard = createSubagentConfigGuard(source);
+  const config = guard.requireObject(rawConfig, "root");
+  if (config.models === undefined) return { models: null };
+
+  const models = guard.requireObject(config.models, "models");
+  guard.rejectUnsupportedKeys(
+    models,
+    ["default", "thinking", "agents", "validate", "fallback"],
+    "models",
+  );
+
+  const parsed: ModelsConfig = {
+    agents: {},
+    validate: true,
+    fallback: "inherit",
+  };
+
+  if (models.default !== undefined) {
+    parsed.default = guard.requireNonEmptyString(models.default, "models.default");
+  }
+  if (models.thinking !== undefined) {
+    parsed.thinking = parseThinkingLevel(guard, models.thinking, "models.thinking");
+  }
+  if (models.validate !== undefined) {
+    parsed.validate = guard.requireBoolean(models.validate, "models.validate");
+  }
+  if (models.fallback !== undefined) {
+    if (models.fallback !== "default" && models.fallback !== "inherit" && models.fallback !== "fail") {
+      guard.invalid("models.fallback must be one of: default, inherit, fail");
+    }
+    parsed.fallback = models.fallback;
+  }
+  if (models.agents !== undefined) {
+    const agents = guard.requireObject(models.agents, "models.agents");
+    for (const [name, entry] of Object.entries(agents)) {
+      if (FORBIDDEN_AGENT_NAMES.includes(name)) {
+        guard.invalid(`models.agents has unsupported key: ${name}`);
+      }
+      parsed.agents[name] = parseAgentModelConfig(guard, entry, `models.agents.${name}`);
+    }
+  }
+
+  return { models: parsed };
+}
+
 /**
  * Load the sub-agent config. A missing file is not an error — it just means no
  * model configuration, which is the default state for every installation.
@@ -255,18 +319,12 @@ export function loadSubagentConfig(
   configPath = SUBAGENT_CONFIG_PATH,
   examplePath = SUBAGENT_CONFIG_EXAMPLE_PATH,
 ): SubagentConfig {
-  const read = readSubagentConfigText(configPath, examplePath);
+  const read = readSubagentConfigFile(configPath, examplePath);
   if (!read) return { models: null };
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(read.rawConfig) as unknown;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON in subagent config ${read.sourcePath}: ${detail}`);
-  }
-
-  return parseSubagentConfig(parsed, read.sourcePath);
+  return parseSubagentConfig(
+    parseSubagentConfigJson(read.rawConfig, read.sourcePath),
+    read.sourcePath,
+  );
 }
 
 /**
@@ -299,22 +357,7 @@ export function isModelAvailable(base: string, available: readonly CatalogModel[
 
 /** Human label for a resolution source, for `subagents_list` and warnings. */
 export function formatModelSource(source: ModelSource): string {
-  switch (source) {
-    case "param":
-      return "spawn param";
-    case "config-agent":
-      return "config agent";
-    case "config-default":
-      return "config default";
-    case "agent":
-      return "agent file";
-    case "snapshot":
-      return "snapshot";
-    case "fallback":
-      return "fallback";
-    case "unset":
-      return "unset";
-  }
+  return MODEL_SOURCE_LABELS[source];
 }
 
 interface ResolveInput {
@@ -330,7 +373,7 @@ interface ResolveInput {
  * Turn a model token into an effective model, applying validation and the
  * fallback ladder when the token is not available in this pi installation.
  */
-export function resolveModelToken(input: ResolveInput): ResolvedModel {
+function resolveModelToken(input: ResolveInput): ResolvedModel {
   const models = input.config.models;
   const baseThinking = input.thinking;
 
@@ -495,61 +538,64 @@ export function resolveLoadoutModel(input: {
  * frontmatter model.
  *
  * Creates `config.json` from `config.json.example` when it does not exist yet.
+ * An existing entry of the wrong shape is replaced rather than rejected, so a
+ * shorthand value such as `"scout": "inherit"` can be repaired from the picker.
+ * Returns `changed: false` when the request would not alter the file, so a
+ * reset never creates or rewrites a config that has nothing to remove.
  */
 export function writeModelSelection(opts: {
   agentName: string | null;
   value: string | null;
   configPath?: string;
   examplePath?: string;
-}): { path: string } {
+}): { path: string; changed: boolean } {
   const configPath = opts.configPath ?? SUBAGENT_CONFIG_PATH;
   const examplePath = opts.examplePath ?? SUBAGENT_CONFIG_EXAMPLE_PATH;
 
-  if (opts.agentName && !/^[A-Za-z0-9._-]+$/.test(opts.agentName)) {
+  if (opts.agentName && !AGENT_NAME_PATTERN.test(opts.agentName)) {
     throw new Error(`Refusing to write model selection for unsafe agent name "${opts.agentName}"`);
   }
 
-  const read = readSubagentConfigText(configPath, examplePath);
+  if (opts.value === null && !existsSync(configPath)) {
+    return { path: configPath, changed: false };
+  }
+
+  const read = readSubagentConfigFile(configPath, examplePath);
+  const guard = createSubagentConfigGuard(read?.sourcePath ?? configPath);
+
   let root: Record<string, unknown> = {};
   if (read) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(read.rawConfig) as unknown;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`Cannot update ${read.sourcePath}: ${detail}`);
-    }
-    root = requireObject(parsed, read.sourcePath, "root");
+    root = guard.requireObject(parseSubagentConfigJson(read.rawConfig, read.sourcePath), "root");
   }
 
-  const existingModels = root.models;
-  if (existingModels !== undefined) {
-    requireObject(existingModels, "config", "models");
-  }
-  const models = (existingModels as Record<string, unknown> | undefined) ?? {};
-  root.models = models;
+  const models =
+    root.models === undefined ? {} : guard.requireObject(root.models, "models");
 
   if (opts.agentName) {
-    const existingAgents = models.agents;
-    if (existingAgents !== undefined) {
-      requireObject(existingAgents, "config", "models.agents");
+    const agents =
+      models.agents === undefined ? {} : guard.requireObject(models.agents, "models.agents");
+    const currentEntry = agents[opts.agentName];
+
+    if (opts.value === null && currentEntry === undefined) {
+      return { path: configPath, changed: false };
     }
-    const agents = (existingAgents as Record<string, unknown> | undefined) ?? {};
-    models.agents = agents;
 
     if (opts.value === null) {
       delete agents[opts.agentName];
     } else {
-      const entry = (agents[opts.agentName] as Record<string, unknown> | undefined) ?? {};
+      const entry = guard.isPlainObject(currentEntry) ? { ...currentEntry } : {};
       entry.model = opts.value;
       agents[opts.agentName] = entry;
     }
+    models.agents = agents;
   } else if (opts.value === null) {
+    if (models.default === undefined) return { path: configPath, changed: false };
     delete models.default;
   } else {
     models.default = opts.value;
   }
 
-  writeFileSync(configPath, `${JSON.stringify(root, null, 2)}\n`, "utf8");
-  return { path: configPath };
+  root.models = models;
+  writeFileSync(configPath, `${JSON.stringify(root, null, CONFIG_JSON_INDENT)}\n`, "utf8");
+  return { path: configPath, changed: true };
 }
