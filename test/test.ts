@@ -1207,10 +1207,13 @@ describe("subagent discovery", () => {
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
+    // Compare on POSIX separators so the assertion holds on Windows too.
+    const endsWith = (value: string | undefined, suffix: string) =>
+      !!value && value.replace(/\\/g, "/").endsWith(suffix);
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+    assert.ok(endsWith(testApi.getToolExtensionPath("web_search"), "web-search/index.ts"));
+    assert.ok(endsWith(testApi.getToolExtensionPath("safe_bash"), "tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
