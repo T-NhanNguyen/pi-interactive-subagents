@@ -66,9 +66,9 @@ export interface AgentModelConfig {
 }
 
 export interface ModelsConfig {
-  /** Fallback model for every agent that has no per-agent entry. */
+  /** Model for every agent without a per-agent entry. Takes precedence over frontmatter `model:`. */
   default?: string;
-  /** Fallback thinking level for every agent. */
+  /** Thinking level for every agent. Takes precedence over frontmatter `thinking:`. */
   thinking?: ThinkingLevelName;
   /** Per-agent overrides, keyed by agent name. */
   agents: Record<string, AgentModelConfig>;
@@ -495,19 +495,24 @@ export function resolveSubagentModel(input: {
 
   const thinking = agentEntry?.thinking ?? models?.thinking ?? input.agentThinking ?? null;
 
-  if (input.param) {
-    return resolveModelToken({ ...input, token: input.param, source: "param", thinking });
-  }
-  if (agentEntry?.model) {
-    return resolveModelToken({ ...input, token: agentEntry.model, source: "config-agent", thinking });
-  }
-  if (models?.default) {
-    return resolveModelToken({ ...input, token: models.default, source: "config-default", thinking });
-  }
-  if (input.agentModel) {
-    return resolveModelToken({ ...input, token: input.agentModel, source: "agent", thinking });
-  }
-  return resolveModelToken({ ...input, token: null, source: "unset", thinking });
+  // Highest precedence first; the first entry with a token wins. Config entries
+  // deliberately outrank the agent's own frontmatter, so a `models` entry can
+  // redirect an agent without editing its file.
+  const precedence: ReadonlyArray<{ source: ModelSource; token: string | null | undefined }> = [
+    { source: "param", token: input.param },
+    { source: "config-agent", token: agentEntry?.model },
+    { source: "config-default", token: models?.default },
+    { source: "agent", token: input.agentModel },
+  ];
+
+  const chosen = precedence.find((entry) => entry.token);
+
+  return resolveModelToken({
+    ...input,
+    token: chosen?.token ?? null,
+    source: chosen?.source ?? "unset",
+    thinking,
+  });
 }
 
 /**
