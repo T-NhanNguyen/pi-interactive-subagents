@@ -56,6 +56,7 @@ import {
   writeModelSelection,
   type ModelCatalog,
 } from "../pi-extension/subagents/config.ts";
+import { buildModelPickerItems, ModelPickerComponent } from "../pi-extension/subagents/model-picker.ts";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -1284,6 +1285,106 @@ describe("config.ts", () => {
     assert.equal(literal.thinking, "low");
   });
 
+  it("prefers the current config over the loadout snapshot on resume", () => {
+    const catalog = makeCatalog(["vendor/alpha", "vendor/beta", "vendor/from-file"]);
+    const loadout = { model: "vendor/from-file", thinking: "low", agent: "scout" };
+
+    const agentConfig = parseSubagentConfig({
+      models: { agents: { scout: { model: "vendor/beta", thinking: "high" } }, default: "vendor/alpha" },
+    });
+    const fromAgent = resolveLoadoutModel({ loadout, config: agentConfig, catalog });
+    assert.equal(fromAgent.source, "config-agent");
+    assert.equal(fromAgent.command, "vendor/beta");
+    assert.equal(fromAgent.thinking, "high", "a config thinking level overrides the snapshot");
+
+    const defaultConfig = parseSubagentConfig({ models: { default: "vendor/alpha" } });
+    const fromDefault = resolveLoadoutModel({ loadout, config: defaultConfig, catalog });
+    assert.equal(fromDefault.source, "config-default");
+    assert.equal(fromDefault.command, "vendor/alpha");
+    assert.equal(fromDefault.thinking, "low", "with no config thinking the snapshot level survives");
+
+    const fromSnapshot = resolveLoadoutModel({ loadout, config: parseSubagentConfig({}), catalog });
+    assert.equal(fromSnapshot.source, "snapshot");
+    assert.equal(fromSnapshot.command, "vendor/from-file");
+  });
+
+  it("reads the legacy package config and migrates it on write", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "subagents.json");
+      const legacyPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(
+        legacyPath,
+        JSON.stringify({
+          status: { enabled: true },
+          models: { agents: { scout: { model: "vendor/legacy" } } },
+        }),
+      );
+
+      const loaded = loadSubagentConfig(configPath, examplePath, legacyPath);
+      assert.equal(loaded.models?.agents.scout?.model, "vendor/legacy");
+
+      const result = writeModelSelection({
+        agentName: "worker",
+        value: "vendor/alpha",
+        configPath,
+        examplePath,
+        legacyPath,
+      });
+      assert.equal(result.changed, true);
+      assert.equal(result.path, configPath, "the write lands in the durable path");
+
+      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.status, { enabled: true }, "the legacy status survives the migration");
+      assert.equal(parsed.models.agents.scout.model, "vendor/legacy");
+      assert.equal(parsed.models.agents.worker.model, "vendor/alpha");
+    });
+  });
+
+  it("builds sorted picker items and flags the current model", () => {
+    const items = buildModelPickerItems({
+      models: [
+        { provider: "vendor", id: "beta", name: "Beta" },
+        { provider: "vendor", id: "alpha" },
+        { provider: "vendor", id: "beta" },
+      ],
+      currentValue: "vendor/beta",
+      leadingItems: [{ value: INHERIT_TOKEN, label: "inherit", searchText: "inherit" }],
+    });
+
+    assert.deepEqual(
+      items.map((item) => item.value),
+      [INHERIT_TOKEN, "vendor/alpha", "vendor/beta"],
+      "leading rows come first, duplicates collapse, models sort",
+    );
+    assert.equal(items.find((item) => item.value === "vendor/beta")?.current, true);
+    assert.equal(items.find((item) => item.value === "vendor/alpha")?.current, false);
+  });
+
+  it("bounds the picker list and marks the current model", () => {
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    };
+    const models = Array.from({ length: 40 }, (_, index) => ({
+      provider: "vendor",
+      id: `model-${String(index).padStart(2, "0")}`,
+    }));
+    const items = buildModelPickerItems({ models, currentValue: "vendor/model-30" });
+
+    const component = new ModelPickerComponent(theme, { title: "model", items, maxVisible: 10 }, () => {});
+    const lines = component.render(80);
+    const modelRows = lines.filter((line) => line.includes("vendor/model-"));
+
+    assert.ok(modelRows.length <= 10, `the view stays bounded, got ${modelRows.length} model rows`);
+    assert.ok(lines.some((line) => line.includes("(31/40)")), "a scroll indicator shows the position");
+    assert.ok(
+      lines.some((line) => line.includes("●") && line.includes("vendor/model-30")),
+      "the current model is marked",
+    );
+  });
+
   it("writes a selection, preserves other keys, and supports reset", () => {
     withConfigFixture(({ configPath, examplePath }) => {
       // No config.json yet: it is created from the example.
@@ -1361,6 +1462,7 @@ describe("config.ts", () => {
     withTempDir((dir) => {
       const configPath = join(dir, "config.json");
       const examplePath = join(dir, "config.json.example");
+      const legacyPath = join(dir, "legacy-config.json");
       writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
 
       const result = writeModelSelection({
@@ -1368,10 +1470,40 @@ describe("config.ts", () => {
         value: null,
         configPath,
         examplePath,
+        legacyPath,
       });
 
       assert.equal(result.changed, false);
       assert.equal(existsSync(configPath), false, "a reset must not create the file");
+    });
+  });
+
+  it("clears a legacy-only entry by migrating it to the durable path", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "subagents.json");
+      const examplePath = join(dir, "config.json.example");
+      const legacyPath = join(dir, "config.json");
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(
+        legacyPath,
+        JSON.stringify({
+          status: { enabled: true },
+          models: { agents: { scout: { model: "vendor/legacy" } } },
+        }),
+      );
+
+      const result = writeModelSelection({
+        agentName: "scout",
+        value: null,
+        configPath,
+        examplePath,
+        legacyPath,
+      });
+
+      assert.equal(result.changed, true);
+      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents, {}, "the cleared entry is gone from the migrated file");
+      assert.deepEqual(parsed.status, { enabled: true });
     });
   });
 

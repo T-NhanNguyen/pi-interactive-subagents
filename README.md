@@ -165,7 +165,9 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Model configuration
 
-A sub-agent model comes from the spawn `model` parameter, the `models` section of `config.json`, or the agent frontmatter, in that order. The `models` section is optional. Without it, models come from the agent frontmatter exactly as before.
+A sub-agent model comes from the spawn `model` parameter, the `models` section of the subagent config, or the agent frontmatter, in that order. The `models` section is optional. Without it, models come from the agent frontmatter exactly as before.
+
+The config lives at `<agent-dir>/subagents.json` (default `~/.pi/agent/subagents.json`), outside the package checkout, so a package update cannot delete it. A legacy package-root `config.json` is still read as a fallback until the next write migrates it.
 
 ```json
 {
@@ -201,17 +203,17 @@ Resolution order, first match wins:
 | 4 | The `model:` field in the agent frontmatter. |
 | 5 | The pi session default, when no model applies. |
 
-A value is a `provider/modelId` string, a bare `modelId`, or `inherit`. `inherit` runs the sub-agent on the parent session's active model and thinking level. The loadout snapshot stores the token `inherit` as it is, so a resumed sub-agent follows the model of the session that resumes it.
+A value is a `provider/modelId` string, a bare `modelId`, or `inherit`. `inherit` runs the sub-agent on the parent session's active model and thinking level. On resume the current config wins over the model stored in the loadout snapshot, so a `/subagent-model` change applies to sub-agents that already exist; the snapshot is only used when the config has no entry for the agent.
 
 A model that this installation cannot run follows `fallback`. With the default `inherit` the sub-agent still starts and the parent shows a warning. Set `fallback` to `fail` to refuse the spawn instead. Set `validate` to `false` to pass every model through unchanged.
 
-Use `/subagent-model` to pick a model for one agent or for all agents. The command writes `config.json` and keeps the `status` section. `subagents_list` shows the model each agent will use and where it came from.
+Use `/subagent-model` to pick a model for one agent or for all agents. The picker scrolls with the selected row kept in view, supports fuzzy filtering, and marks the model currently configured for the target. It lists the session's `/scoped-models` set when one is configured, otherwise the credentialed catalogue. The command writes `<agent-dir>/subagents.json` and keeps the `status` section. `subagents_list` shows the model each agent will use and where it came from.
 
 ## Status widget & configuration
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+Status display and model selection share `<agent-dir>/subagents.json` (default `~/.pi/agent/subagents.json`), created on the first `/subagent-model` write. The package ships `config.json.example` as the default:
 
 ```json
 {

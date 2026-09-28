@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
 
 /**
- * Subagent config file (`config.json` at the package root).
+ * Subagent config file (`subagents.json` in the pi agent directory).
  *
  * The file holds two independent sections:
  *   - `status` — status-line rendering (parsed by status.ts);
@@ -16,14 +17,30 @@ import { fileURLToPath } from "node:url";
  * This module also owns the shared config-file primitives — the validation
  * guard, the raw JSON reader, and the file paths — so status.ts and the models
  * parser cannot drift apart.
+ *
+ * The file lives in the agent directory (default `~/.pi/agent`) rather than the
+ * package checkout: the checkout is git-managed and `git clean -fdx` runs on a
+ * package update, which would delete an ignored file inside it. The legacy
+ * package-root `config.json` is still read once, so existing picks migrate on
+ * the next write.
  */
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-export const SUBAGENT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+
+/** Primary, durable location for user configuration, inside the pi agent dir. */
+export const SUBAGENT_CONFIG_PATH = join(getAgentDir(), "subagents.json");
+
+/**
+ * Legacy location inside the package checkout. Read-only, kept so a user who
+ * configured models before this move keeps their selection.
+ */
+export const SUBAGENT_LEGACY_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+
+/** Shipped defaults, used only when no user config exists yet. */
 export const SUBAGENT_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 /** Default source label used when a caller has no file path at hand. */
-const DEFAULT_CONFIG_SOURCE = "config.json";
+const DEFAULT_CONFIG_SOURCE = "subagents.json";
 
 /** Indent width for the config file this extension writes back. */
 const CONFIG_JSON_INDENT = 2;
@@ -210,26 +227,31 @@ export function parseSubagentConfigJson(rawConfig: string, sourcePath: string): 
   }
 }
 
+/** Return the first candidate config file that can be read, or null when none exists. */
+function readFirstExistingConfigFile(
+  candidatePaths: readonly string[],
+): { sourcePath: string; rawConfig: string } | null {
+  for (const path of candidatePaths) {
+    try {
+      return { sourcePath: path, rawConfig: readFileSync(path, "utf8") };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return null;
+}
+
 /**
- * Read the raw config text, preferring `config.json` over the shipped example.
- * Returns null when neither file exists.
+ * Read the raw config text. The durable agent-dir file wins, then the legacy
+ * package-root `config.json`, then the shipped example. Returns null when none
+ * exists.
  */
 export function readSubagentConfigFile(
   configPath = SUBAGENT_CONFIG_PATH,
   examplePath = SUBAGENT_CONFIG_EXAMPLE_PATH,
+  legacyPath = SUBAGENT_LEGACY_CONFIG_PATH,
 ): { sourcePath: string; rawConfig: string } | null {
-  try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-
-  try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
+  return readFirstExistingConfigFile([configPath, legacyPath, examplePath]);
 }
 
 function parseThinkingLevel(
@@ -318,8 +340,9 @@ export function parseSubagentConfig(rawConfig: unknown, source = DEFAULT_CONFIG_
 export function loadSubagentConfig(
   configPath = SUBAGENT_CONFIG_PATH,
   examplePath = SUBAGENT_CONFIG_EXAMPLE_PATH,
+  legacyPath = SUBAGENT_LEGACY_CONFIG_PATH,
 ): SubagentConfig {
-  const read = readSubagentConfigFile(configPath, examplePath);
+  const read = readSubagentConfigFile(configPath, examplePath, legacyPath);
   if (!read) return { models: null };
   return parseSubagentConfig(
     parseSubagentConfigJson(read.rawConfig, read.sourcePath),
@@ -516,24 +539,36 @@ export function resolveSubagentModel(input: {
 }
 
 /**
- * Re-resolve a model recorded in a loadout snapshot.
+ * Re-resolve the model for a sub-agent that is being resumed.
  *
- * A literal model is replayed as-is (subject to validation). The inherit token
- * is resolved against the parent session that is resuming the sub-agent, which
- * is the whole point of storing the token rather than a frozen model id.
+ * The user's current pick always wins: the agent's config entry, then the
+ * config default, then the token frozen in the snapshot. The snapshot is only
+ * a fallback, so resuming an older sub-agent after a `/subagent-model` change
+ * runs the new model instead of the one captured at its first spawn. An
+ * `inherit` snapshot still follows the parent session whenever no config entry
+ * outranks it.
  */
 export function resolveLoadoutModel(input: {
   loadout: { model: string | null; thinking: string | null; agent: string | null };
   config: SubagentConfig;
   catalog: ModelCatalog;
 }): ResolvedModel {
+  const models = input.config.models;
+  const agentEntry = input.loadout.agent ? models?.agents[input.loadout.agent] : undefined;
+  const configuredToken = agentEntry?.model ?? models?.default;
+
+  const source: ModelSource = agentEntry?.model
+    ? "config-agent"
+    : models?.default
+      ? "config-default"
+      : "snapshot";
+  const thinking = agentEntry?.thinking ?? models?.thinking ?? input.loadout.thinking ?? null;
+
   return resolveModelToken({
-    token: input.loadout.model,
-    source: "snapshot",
-    agentName: input.loadout.agent,
-    thinking: input.loadout.thinking,
-    config: input.config,
-    catalog: input.catalog,
+    ...input,
+    token: configuredToken ?? input.loadout.model,
+    source,
+    thinking,
   });
 }
 
@@ -553,19 +588,21 @@ export function writeModelSelection(opts: {
   value: string | null;
   configPath?: string;
   examplePath?: string;
+  legacyPath?: string;
 }): { path: string; changed: boolean } {
   const configPath = opts.configPath ?? SUBAGENT_CONFIG_PATH;
   const examplePath = opts.examplePath ?? SUBAGENT_CONFIG_EXAMPLE_PATH;
+  const legacyPath = opts.legacyPath ?? SUBAGENT_LEGACY_CONFIG_PATH;
 
   if (opts.agentName && !AGENT_NAME_PATTERN.test(opts.agentName)) {
     throw new Error(`Refusing to write model selection for unsafe agent name "${opts.agentName}"`);
   }
 
-  if (opts.value === null && !existsSync(configPath)) {
+  if (opts.value === null && !existsSync(configPath) && !existsSync(legacyPath)) {
     return { path: configPath, changed: false };
   }
 
-  const read = readSubagentConfigFile(configPath, examplePath);
+  const read = readSubagentConfigFile(configPath, examplePath, legacyPath);
   const guard = createSubagentConfigGuard(read?.sourcePath ?? configPath);
 
   let root: Record<string, unknown> = {};

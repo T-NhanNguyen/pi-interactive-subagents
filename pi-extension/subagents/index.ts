@@ -66,6 +66,12 @@ import {
   type SubagentConfig,
 } from "./config.ts";
 import {
+  buildModelPickerItems,
+  ModelPickerComponent,
+  type ModelPickerItem,
+  type ModelPickerModel,
+} from "./model-picker.ts";
+import {
   getSubagentActivityFile,
   readSubagentActivityFile,
   type ActivityReadResult,
@@ -1236,6 +1242,38 @@ function unknownConfiguredAgentNames(
   return Object.keys(config.models?.agents ?? {})
     .filter((name) => !known.has(name))
     .sort();
+}
+
+/** Sentinel value the picker returns for "reset to the agent's own model". */
+const RESET_MODEL_CHOICE = "reset-to-the-agents-own-model";
+
+/** Models offered by /subagent-model: the session's scoped set, else the credentialed catalogue. */
+function collectPickableModels(ctx: ExtensionContext): ModelPickerModel[] {
+  const scopedModels = ctx.scopedModels ?? [];
+  if (scopedModels.length > 0) {
+    return scopedModels.map((entry) => entry.model);
+  }
+
+  const registry = ctx.modelRegistry;
+  return (registry?.getAvailable() ?? []).filter(
+    (model) => !registry?.hasConfiguredAuth || registry.hasConfiguredAuth(model),
+  );
+}
+
+/** Show the scrollable picker in TUI mode, falling back to the plain selector elsewhere. */
+async function pickModelChoice(
+  ctx: ExtensionContext,
+  title: string,
+  items: readonly ModelPickerItem[],
+): Promise<string | undefined> {
+  if (ctx.mode !== "tui") {
+    const chosenLabel = await ctx.ui.select(`${title}:`, items.map((item) => item.label));
+    return items.find((item) => item.label === chosenLabel)?.value;
+  }
+
+  return ctx.ui.custom<string | undefined>((_tui, theme, _keybindings, done) =>
+    new ModelPickerComponent(theme, { title, items }, done),
+  );
 }
 
 /** Separator between a model id and its source in the `subagents_list` tag. */
@@ -2480,7 +2518,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // /subagent-model command — pick which model an agent runs on
   pi.registerCommand("subagent-model", {
-    description: "Choose which model a sub-agent runs on (writes config.json)",
+    description: "Choose which model a sub-agent runs on (writes the subagent config)",
     handler: async (_args, ctx) => {
       const registry = ctx.modelRegistry;
       if (!registry?.getAvailable) {
@@ -2497,26 +2535,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const target = await ctx.ui.select("Set the sub-agent model for:", [allLabel, ...agentNames]);
       if (!target) return;
 
-      // Offer only models this installation can actually run, mirroring /models.
-      const modelIds = [
-        ...new Set(
-          registry
-            .getAvailable()
-            .filter((model) => !registry.hasConfiguredAuth || registry.hasConfiguredAuth(model))
-            .map((model) => `${model.provider}/${model.id}`),
-        ),
-      ].sort();
+      const agentName = target === allLabel ? null : target;
+      const config = loadSubagentConfig();
+      const configuredEntry = agentName ? config.models?.agents[agentName] : undefined;
+      const currentValue = configuredEntry?.model ?? config.models?.default ?? null;
 
-      const resetLabel = "reset to the agent's own model";
-      const choice = await ctx.ui.select(`${target} — model:`, [
-        INHERIT_TOKEN,
-        resetLabel,
-        ...modelIds,
-      ]);
+      const items = buildModelPickerItems({
+        models: collectPickableModels(ctx),
+        currentValue,
+        leadingItems: [
+          {
+            value: INHERIT_TOKEN,
+            label: "inherit — follow this session's model",
+            searchText: "inherit follow this session model",
+          },
+          {
+            value: RESET_MODEL_CHOICE,
+            label: "reset to the agent's own model",
+            searchText: "reset to the agent own model",
+          },
+        ],
+      });
+
+      const choice = await pickModelChoice(ctx, `${target} — model`, items);
       if (!choice) return;
 
-      const agentName = target === allLabel ? null : target;
-      const value = choice === resetLabel ? null : choice;
+      const value = choice === RESET_MODEL_CHOICE ? null : choice;
 
       try {
         const { path, changed } = writeModelSelection({ agentName, value });
