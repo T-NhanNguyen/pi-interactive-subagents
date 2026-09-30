@@ -59,7 +59,7 @@ const FORBIDDEN_AGENT_NAMES = ["__proto__", "constructor"];
 export const INHERIT_TOKEN = "inherit";
 
 /** pi thinking levels, in ascending order. */
-const THINKING_LEVELS = [
+export const THINKING_LEVELS = [
   "off",
   "minimal",
   "low",
@@ -109,6 +109,10 @@ export interface CatalogModel {
   provider: string;
   id: string;
   name?: string;
+  /** Whether the model supports thinking at all. Absent means unknown. */
+  reasoning?: boolean;
+  /** Thinking levels the model supports, or undefined when unknown. */
+  supportedThinking?: readonly ThinkingLevelName[];
 }
 
 /** The live model environment of the session that is spawning a sub-agent. */
@@ -117,6 +121,8 @@ export interface ModelCatalog {
   parentModel: string | null;
   /** Parent session's effective thinking level, or null when unknown. */
   parentThinking: string | null;
+  /** Thinking levels the parent session's model supports, or undefined when unknown. */
+  parentSupportedThinking?: readonly ThinkingLevelName[];
   /** Every model with resolved credentials, from the pi model registry. */
   available: readonly CatalogModel[];
 }
@@ -370,12 +376,87 @@ export function parseModelToken(token: string): {
   return { base: trimmed, thinking: null };
 }
 
+/** Thinking levels a model supports, mirroring pi-ai's getSupportedThinkingLevels. */
+export function supportedThinkingLevels(model: {
+  reasoning?: boolean;
+  thinkingLevelMap?: Partial<Record<ThinkingLevelName, string | null>>;
+}): ThinkingLevelName[] {
+  if (!model.reasoning) return ["off"];
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+
+/** Snap a requested thinking level to the nearest supported one. */
+export function clampThinkingLevel(
+  level: ThinkingLevelName,
+  supported: readonly ThinkingLevelName[],
+): ThinkingLevelName {
+  if (supported.length === 0) return "off";
+
+  const requestedIndex = THINKING_LEVELS.indexOf(level);
+  if (requestedIndex >= 0) {
+    let best: ThinkingLevelName | null = null;
+    for (const candidate of supported) {
+      const candidateIndex = THINKING_LEVELS.indexOf(candidate);
+      if (candidateIndex <= requestedIndex && (best === null || candidateIndex > THINKING_LEVELS.indexOf(best))) {
+        best = candidate;
+      }
+    }
+    if (best !== null) return best;
+  }
+
+  return supported.reduce((lowest, candidate) =>
+    THINKING_LEVELS.indexOf(candidate) < THINKING_LEVELS.indexOf(lowest) ? candidate : lowest,
+  );
+}
+
+/** Clamp a resolved model's thinking level to what the model supports. */
+function adjustThinkingForSupport(
+  thinking: string | null,
+  supported: readonly ThinkingLevelName[] | undefined,
+  validating: boolean,
+): { thinking: string | null; warning: string | null } {
+  if (!validating || supported === undefined) return { thinking, warning: null };
+
+  // A non-reasoning model only supports `off`; resolve it explicitly rather
+  // than silently dropping the suffix.
+  if (supported.length === 1 && supported[0] === "off") {
+    if (thinking === "off" || thinking === null) return { thinking: "off", warning: null };
+    return { thinking: "off", warning: unsupportedThinkingWarning(thinking, "off") };
+  }
+
+  if (thinking === null) return { thinking, warning: null };
+
+  if (supported.includes(thinking as ThinkingLevelName)) return { thinking, warning: null };
+
+  const clamped = clampThinkingLevel(thinking as ThinkingLevelName, supported);
+  return { thinking: clamped, warning: unsupportedThinkingWarning(thinking, clamped) };
+}
+
+function unsupportedThinkingWarning(requested: string, used: string): string {
+  return `Thinking level "${requested}" is not supported by the resolved model; using "${used}" instead.`;
+}
+
+/** Find the available model a token names by bare id or `provider/id`. */
+export function findAvailableModel(
+  token: string,
+  available: readonly CatalogModel[],
+): CatalogModel | undefined {
+  const needle = token.toLowerCase();
+  return available.find(
+    (model) =>
+      model.id.toLowerCase() === needle ||
+      `${model.provider}/${model.id}`.toLowerCase() === needle,
+  );
+}
+
 /** True when `base` matches an available model by `provider/id` or bare id. */
 export function isModelAvailable(base: string, available: readonly CatalogModel[]): boolean {
-  const needle = base.toLowerCase();
-  return available.some(
-    (model) => model.id.toLowerCase() === needle || `${model.provider}/${model.id}`.toLowerCase() === needle,
-  );
+  return findAvailableModel(base, available) !== undefined;
 }
 
 /** Human label for a resolution source, for `subagents_list` and warnings. */
@@ -418,13 +499,18 @@ function resolveModelToken(input: ResolveInput): ResolvedModel {
 
     if (token === INHERIT_TOKEN) {
       if (!input.catalog.parentModel) return null;
+      const adjusted = adjustThinkingForSupport(
+        thinking ?? input.catalog.parentThinking,
+        input.catalog.parentSupportedThinking,
+        models?.validate === true,
+      );
       return {
         token,
         command: input.catalog.parentModel,
-        thinking: thinking ?? input.catalog.parentThinking,
+        thinking: adjusted.thinking,
         source,
         inherited: true,
-        warning: null,
+        warning: adjusted.warning,
         error: null,
       };
     }
@@ -434,13 +520,19 @@ function resolveModelToken(input: ResolveInput): ResolvedModel {
     // rejecting every configured model.
     const validating = models?.validate === true && input.catalog.available.length > 0;
     if (!validating || isModelAvailable(parsed.base, input.catalog.available)) {
+      const catalogModel = findAvailableModel(parsed.base, input.catalog.available);
+      const adjusted = adjustThinkingForSupport(
+        thinking,
+        catalogModel?.supportedThinking,
+        models?.validate === true,
+      );
       return {
         token,
         command: parsed.base,
-        thinking,
+        thinking: adjusted.thinking,
         source,
         inherited: false,
-        warning: null,
+        warning: adjusted.warning,
         error: null,
       };
     }
@@ -488,7 +580,10 @@ function resolveModelToken(input: ResolveInput): ResolvedModel {
     if (!candidate || candidate === input.token) continue;
     const resolved = attempt(candidate, "fallback");
     if (resolved) {
-      resolved.warning = `${reason} Falling back to "${candidate}".`;
+      const fallbackWarning = `${reason} Falling back to "${candidate}".`;
+      resolved.warning = resolved.warning
+        ? `${resolved.warning} ${fallbackWarning}`
+        : fallbackWarning;
       return resolved;
     }
   }
@@ -592,20 +687,13 @@ export function resolveLoadoutModel(input: {
   });
 }
 
-/**
- * Write one model selection into `config.json`, preserving every other key.
- * Passing a null value removes the entry, which restores the agent's own
- * frontmatter model.
- *
- * Creates `config.json` from `config.json.example` when it does not exist yet.
- * An existing entry of the wrong shape is replaced rather than rejected, so a
- * shorthand value such as `"scout": "inherit"` can be repaired from the picker.
- * Returns `changed: false` when the request would not alter the file, so a
- * reset never creates or rewrites a config that has nothing to remove.
- */
+/** Write model and/or thinking selections into the config, preserving every other key. */
 export function writeModelSelection(opts: {
   agentName: string | null;
-  value: string | null;
+  /** undefined = leave the model as-is, null = remove, string = set. */
+  model?: string | null;
+  /** undefined = leave thinking as-is, null = remove, value = set. */
+  thinking?: ThinkingLevelName | null;
   configPath?: string;
   examplePath?: string;
   legacyPath?: string;
@@ -618,7 +706,10 @@ export function writeModelSelection(opts: {
     throw new Error(`Refusing to write model selection for unsafe agent name "${opts.agentName}"`);
   }
 
-  if (opts.value === null && !existsSync(configPath) && !existsSync(legacyPath)) {
+  const removingOnly =
+    (opts.model === null || opts.model === undefined) &&
+    (opts.thinking === null || opts.thinking === undefined);
+  if (removingOnly && !existsSync(configPath) && !existsSync(legacyPath)) {
     return { path: configPath, changed: false };
   }
 
@@ -629,35 +720,55 @@ export function writeModelSelection(opts: {
   if (read) {
     root = guard.requireObject(parseSubagentConfigJson(read.rawConfig, read.sourcePath), "root");
   }
+  const before = JSON.stringify(root);
 
   const models =
     root.models === undefined ? {} : guard.requireObject(root.models, "models");
+  let mutated = false;
+
+  const applyField = (target: Record<string, unknown>, key: string, value: string | null | undefined): void => {
+    if (value === undefined) return;
+    if (value === null) {
+      if (key in target) {
+        delete target[key];
+        mutated = true;
+      }
+      return;
+    }
+    if (target[key] !== value) {
+      target[key] = value;
+      mutated = true;
+    }
+  };
 
   if (opts.agentName) {
     const agents =
       models.agents === undefined ? {} : guard.requireObject(models.agents, "models.agents");
     const currentEntry = agents[opts.agentName];
+    const entry = guard.isPlainObject(currentEntry) ? { ...currentEntry } : {};
+    applyField(entry, "model", opts.model);
+    applyField(entry, "thinking", opts.thinking);
 
-    if (opts.value === null && currentEntry === undefined) {
-      return { path: configPath, changed: false };
-    }
-
-    if (opts.value === null) {
-      delete agents[opts.agentName];
+    if (Object.keys(entry).length === 0) {
+      if (currentEntry !== undefined) {
+        delete agents[opts.agentName];
+        mutated = true;
+      }
     } else {
-      const entry = guard.isPlainObject(currentEntry) ? { ...currentEntry } : {};
-      entry.model = opts.value;
       agents[opts.agentName] = entry;
     }
-    models.agents = agents;
-  } else if (opts.value === null) {
-    if (models.default === undefined) return { path: configPath, changed: false };
-    delete models.default;
+    if (mutated) models.agents = agents;
   } else {
-    models.default = opts.value;
+    applyField(models, "default", opts.model);
+    applyField(models, "thinking", opts.thinking);
   }
 
-  root.models = models;
+  if (mutated) root.models = models;
+
+  if (JSON.stringify(root) === before) {
+    return { path: configPath, changed: false };
+  }
+
   writeFileSync(configPath, `${JSON.stringify(root, null, CONFIG_JSON_INDENT)}\n`, "utf8");
   return { path: configPath, changed: true };
 }

@@ -209,6 +209,10 @@ A model that this installation cannot run follows `fallback`. With the default `
 
 Use `/subagent-model` to pick a model for one agent or for all agents. The picker scrolls with the selected row kept in view, supports fuzzy filtering, and marks the model currently configured for the target. It lists the session's `/scoped-models` set when one is configured, otherwise the credentialed catalogue. The command writes `<agent-dir>/subagents.json` and keeps the `status` section. `subagents_list` shows the model each agent will use and where it came from.
 
+After the model, `/subagent-model` asks for the thinking level. It offers `leave thinking unchanged` (keep the configured value), `reset to inherited/default` (remove the override so the global or frontmatter level applies), and the levels the chosen model supports. Only the chosen model's supported levels are listed: a model that cannot reason offers only `off`, with a note in the dialog, and `inherit` offers the parent session's model's levels. The row for the target's current effective level is pre-selected, and model and thinking are written in one update.
+
+The config accepts any level for any model, because the model can change later. When a configured level is not supported by the model that actually runs, the effective level is clamped to the nearest supported level and the parent shows a warning; a non-reasoning model resolves to `off`.
+
 ## Status widget & configuration
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.

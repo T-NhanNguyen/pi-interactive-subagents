@@ -56,14 +56,18 @@ import {
 } from "./status.ts";
 import {
   INHERIT_TOKEN,
+  THINKING_LEVELS,
+  findAvailableModel,
   formatModelSource,
   loadSubagentConfig,
   resolveLoadoutModel,
   resolveSubagentModel,
+  supportedThinkingLevels,
   writeModelSelection,
   type ModelCatalog,
   type ResolvedModel,
   type SubagentConfig,
+  type ThinkingLevelName,
 } from "./config.ts";
 import {
   buildModelPickerItems,
@@ -1201,10 +1205,13 @@ function buildModelCatalog(ctx: ExtensionContext | undefined): ModelCatalog {
     provider: model.provider,
     id: model.id,
     name: model.name,
+    reasoning: model.reasoning,
+    supportedThinking: supportedThinkingLevels(model),
   }));
   return {
     parentModel: ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
     parentThinking: ctx?.thinkingLevel ?? null,
+    parentSupportedThinking: ctx?.model ? supportedThinkingLevels(ctx.model) : undefined,
     available,
   };
 }
@@ -1246,6 +1253,54 @@ function unknownConfiguredAgentNames(
 
 /** Sentinel value the picker returns for "reset to the agent's own model". */
 const RESET_MODEL_CHOICE = "reset-to-the-agents-own-model";
+
+/** Sentinel value the thinking step returns for "reset to inherited/default". */
+const RESET_THINKING_CHOICE = "reset-to-inherited-thinking";
+
+/** Sentinel value the thinking step returns for "leave thinking unchanged". */
+const LEAVE_THINKING_CHOICE = "leave-thinking-unchanged";
+
+/** Thinking levels a model token supports; `inherit` follows the parent model. */
+function supportedThinkingForToken(
+  token: string | null,
+  catalog: ModelCatalog,
+): readonly ThinkingLevelName[] {
+  if (token === INHERIT_TOKEN) {
+    return catalog.parentSupportedThinking ?? THINKING_LEVELS;
+  }
+  if (token) {
+    const match = findAvailableModel(token, catalog.available);
+    if (match?.supportedThinking) return match.supportedThinking;
+  }
+  return THINKING_LEVELS;
+}
+
+/** Build the thinking step rows, flagging the target's current effective level. */
+function buildThinkingItems(
+  levels: readonly ThinkingLevelName[],
+  currentThinking: ThinkingLevelName | null,
+): ModelPickerItem[] {
+  const items: ModelPickerItem[] = [
+    {
+      value: LEAVE_THINKING_CHOICE,
+      label: "leave thinking unchanged",
+      searchText: "leave thinking unchanged",
+    },
+    {
+      value: RESET_THINKING_CHOICE,
+      label: "reset to inherited/default",
+      searchText: "reset to inherited default thinking",
+    },
+    ...levels.map((level) => ({ value: level, label: level, searchText: level })),
+  ];
+
+  const currentIndex =
+    currentThinking === null
+      ? items.findIndex((item) => item.value === RESET_THINKING_CHOICE)
+      : items.findIndex((item) => item.value === currentThinking);
+  if (currentIndex >= 0) items[currentIndex] = { ...items[currentIndex], current: true };
+  return items;
+}
 
 /** Models offered by /subagent-model: the session's scoped set, else the credentialed catalogue. */
 function collectPickableModels(ctx: ExtensionContext): ModelPickerModel[] {
@@ -2561,17 +2616,41 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (!choice) return;
 
       const value = choice === RESET_MODEL_CHOICE ? null : choice;
+      const catalog = buildModelCatalog(ctx);
+      const levels = supportedThinkingForToken(
+        choice === RESET_MODEL_CHOICE ? currentValue : choice,
+        catalog,
+      );
+      const nonReasoning = levels.length === 1 && levels[0] === "off";
+      const currentThinking = configuredEntry?.thinking ?? config.models?.thinking ?? null;
+      const thinkingItems = buildThinkingItems(levels, currentThinking);
+      const thinkingTitle = nonReasoning
+        ? `${target} — thinking (this model does not support thinking levels, only "off")`
+        : `${target} — thinking`;
+
+      const thinkingChoice = await pickModelChoice(ctx, thinkingTitle, thinkingItems);
+      if (!thinkingChoice) return;
+
+      const thinking: ThinkingLevelName | null | undefined =
+        thinkingChoice === LEAVE_THINKING_CHOICE
+          ? undefined
+          : thinkingChoice === RESET_THINKING_CHOICE
+            ? null
+            : (thinkingChoice as ThinkingLevelName);
 
       try {
-        const { path, changed } = writeModelSelection({ agentName, value });
+        const { path, changed } = writeModelSelection({ agentName, model: value, thinking });
         if (!changed) {
           ctx.ui.notify(`Nothing to clear for ${target} — no override is set.`, "info");
           return;
         }
+        const modelLabel = value === null ? "the agent default" : value;
+        const thinkingLabel =
+          thinking === undefined
+            ? currentThinking ?? "unchanged"
+            : thinking ?? "inherited/default";
         ctx.ui.notify(
-          value === null
-            ? `Cleared the model override for ${target}.`
-            : `Set ${target} to ${value}. Written to ${path}.`,
+          `Set ${target}: model ${modelLabel}, thinking ${thinkingLabel}. Written to ${path}.`,
           "info",
         );
       } catch (error) {

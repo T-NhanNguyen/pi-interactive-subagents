@@ -54,7 +54,11 @@ import {
   resolveSubagentModel,
   resolveLoadoutModel,
   writeModelSelection,
+  supportedThinkingLevels,
+  clampThinkingLevel,
+  type CatalogModel,
   type ModelCatalog,
+  type ThinkingLevelName,
 } from "../pi-extension/subagents/config.ts";
 import { buildModelPickerItems, ModelPickerComponent } from "../pi-extension/subagents/model-picker.ts";
 import {
@@ -1082,13 +1086,25 @@ describe("config.ts", () => {
   const testApi = (subagentsModule as any).__test__;
 
   /** Catalog helper: the first entry is the parent session's active model. */
-  function makeCatalog(entries: string[], parentThinking: string | null = "low"): ModelCatalog {
+  function makeCatalog(
+    entries: string[],
+    parentThinking: string | null = "low",
+    options: {
+      parentModel?: string | null;
+      parentSupportedThinking?: readonly ThinkingLevelName[];
+      capabilities?: Record<string, Omit<CatalogModel, "provider" | "id">>;
+    } = {},
+  ): ModelCatalog {
     return {
-      parentModel: entries[0] ?? null,
+      parentModel:
+        options.parentModel !== undefined ? options.parentModel : (entries[0] ?? null),
       parentThinking,
+      parentSupportedThinking: options.parentSupportedThinking,
       available: entries.map((entry) => {
         const slash = entry.indexOf("/");
-        return { provider: entry.slice(0, slash), id: entry.slice(slash + 1) };
+        const provider = entry.slice(0, slash);
+        const id = entry.slice(slash + 1);
+        return { provider, id, ...options.capabilities?.[id] };
       }),
     };
   }
@@ -1147,6 +1163,40 @@ describe("config.ts", () => {
     assert.equal(isModelAvailable("vendor/alpha", available), true);
     assert.equal(isModelAvailable("ALPHA", available), true);
     assert.equal(isModelAvailable("vendor/other", available), false);
+  });
+
+  it("reports the thinking levels each model supports", () => {
+    assert.deepEqual(
+      supportedThinkingLevels({ reasoning: false, thinkingLevelMap: { high: "high" } }),
+      ["off"],
+      "a non-reasoning model only supports off even with a map",
+    );
+    assert.deepEqual(
+      supportedThinkingLevels({ reasoning: true }),
+      ["off", "minimal", "low", "medium", "high"],
+      "xhigh and max require an explicit map entry",
+    );
+    assert.deepEqual(
+      supportedThinkingLevels({ reasoning: true, thinkingLevelMap: { medium: null } }),
+      ["off", "minimal", "low", "high"],
+      "a null map entry excludes that level",
+    );
+    assert.deepEqual(
+      supportedThinkingLevels({ reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } }),
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      "an explicit xhigh/max entry includes it",
+    );
+  });
+
+  it("clamps a thinking level to the nearest supported one", () => {
+    assert.equal(clampThinkingLevel("max", ["off", "low"]), "low", "highest supported at or below wins");
+    assert.equal(
+      clampThinkingLevel("minimal", ["low", "high"]),
+      "low",
+      "with nothing below the request the lowest supported wins",
+    );
+    assert.equal(clampThinkingLevel("high", []), "off", "an empty support set collapses to off");
+    assert.equal(clampThinkingLevel("medium", ["off", "medium", "max"]), "medium", "an exact match is preserved");
   });
 
   it("resolves config agent before param, config before frontmatter", () => {
@@ -1343,6 +1393,186 @@ describe("config.ts", () => {
     const fromSnapshot = resolveLoadoutModel({ loadout, config: parseSubagentConfig({}), catalog });
     assert.equal(fromSnapshot.source, "snapshot");
     assert.equal(fromSnapshot.command, "vendor/from-file");
+    assert.equal(fromSnapshot.thinking, "low", "the snapshot level survives when nothing overrides it");
+  });
+
+  it("clamps an unsupported thinking level and warns when validating", () => {
+    const catalog = makeCatalog(["vendor/reasoner", "vendor/plain"], "low", {
+      parentSupportedThinking: ["off", "minimal", "low", "medium"],
+      capabilities: {
+        reasoner: { reasoning: true, supportedThinking: ["off", "low", "medium", "high"] },
+      },
+    });
+    const config = parseSubagentConfig({
+      models: { agents: { scout: { model: "vendor/reasoner", thinking: "max" } } },
+    });
+    const clamped = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: null,
+      agentThinking: null,
+      config,
+      catalog,
+    });
+    assert.equal(clamped.command, "vendor/reasoner");
+    assert.equal(clamped.thinking, "high", "max is clamped to the highest supported level");
+    assert.match(clamped.warning ?? "", /Thinking level "max"/);
+
+    const unknown = parseSubagentConfig({
+      models: { agents: { scout: { model: "vendor/plain", thinking: "max" } } },
+    });
+    const unclamped = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: null,
+      agentThinking: null,
+      config: unknown,
+      catalog,
+    });
+    assert.equal(unclamped.thinking, "max", "an unknown capability is left alone");
+    assert.equal(unclamped.warning, null);
+  });
+
+  it("resolves a non-reasoning model to off and warns when a level was configured", () => {
+    const catalog = makeCatalog(["vendor/text"], null, {
+      parentModel: null,
+      capabilities: {
+        text: { reasoning: false, supportedThinking: ["off"] },
+      },
+    });
+    const configured = parseSubagentConfig({
+      models: { agents: { scout: { model: "vendor/text", thinking: "high" } } },
+    });
+    const resolved = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: null,
+      agentThinking: null,
+      config: configured,
+      catalog,
+    });
+    assert.equal(resolved.command, "vendor/text");
+    assert.equal(resolved.thinking, "off");
+    assert.match(resolved.warning ?? "", /not supported/);
+
+    const unset = parseSubagentConfig({ models: { agents: { scout: { model: "vendor/text" } } } });
+    const explicitOff = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: null,
+      agentThinking: null,
+      config: unset,
+      catalog,
+    });
+    assert.equal(explicitOff.thinking, "off", "a non-reasoning model resolves to an explicit off");
+    assert.equal(explicitOff.warning, null);
+  });
+
+  it("clamps inherit thinking against the parent model's supported levels", () => {
+    const catalog = makeCatalog(["vendor/parent"], "medium", {
+      parentSupportedThinking: ["off", "low", "medium"],
+    });
+    const config = parseSubagentConfig({
+      models: { agents: { scout: { model: INHERIT_TOKEN, thinking: "max" } } },
+    });
+    const resolved = resolveSubagentModel({
+      param: null,
+      agentName: "scout",
+      agentModel: null,
+      agentThinking: null,
+      config,
+      catalog,
+    });
+    assert.equal(resolved.inherited, true);
+    assert.equal(resolved.thinking, "medium", "clamped to the parent's highest supported level");
+    assert.match(resolved.warning ?? "", /Thinking level "max"/);
+  });
+
+  it("sets thinking while preserving the model and other entry keys", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(
+        configPath,
+        JSON.stringify({ models: { agents: { scout: { model: "vendor/alpha", tier: "fast" } } } }),
+      );
+
+      const result = writeModelSelection({ agentName: "scout", thinking: "high", configPath, examplePath });
+      assert.equal(result.changed, true);
+      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents.scout, {
+        model: "vendor/alpha",
+        tier: "fast",
+        thinking: "high",
+      });
+    });
+  });
+
+  it("clears one field without touching the other", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(
+        configPath,
+        JSON.stringify({ models: { agents: { scout: { model: "vendor/alpha", thinking: "high" } } } }),
+      );
+
+      writeModelSelection({ agentName: "scout", thinking: null, configPath, examplePath });
+      let parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents.scout, { model: "vendor/alpha" });
+
+      // Restore the level, then clear only the model and keep thinking.
+      writeModelSelection({ agentName: "scout", thinking: "high", configPath, examplePath });
+      writeModelSelection({ agentName: "scout", model: null, configPath, examplePath });
+      parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents.scout, { thinking: "high" });
+    });
+  });
+
+  it("deletes an agent entry that becomes empty after a clear", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(
+        configPath,
+        JSON.stringify({ models: { agents: { scout: { model: "vendor/alpha" } } } }),
+      );
+
+      const result = writeModelSelection({ agentName: "scout", model: null, configPath, examplePath });
+      assert.equal(result.changed, true);
+      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(parsed.models.agents, {});
+    });
+  });
+
+  it("supports setting and clearing only the global thinking level", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      const set = writeModelSelection({ agentName: null, thinking: "low", configPath, examplePath });
+      assert.equal(set.changed, true);
+      let parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.equal(parsed.models.thinking, "low");
+      assert.equal(parsed.models.default, undefined, "global thinking stands alone without a default model");
+
+      const cleared = writeModelSelection({ agentName: null, thinking: null, configPath, examplePath });
+      assert.equal(cleared.changed, true);
+      parsed = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.equal(parsed.models.thinking, undefined);
+    });
+  });
+
+  it("reports changed false when a write is a no-op", () => {
+    withConfigFixture(({ configPath, examplePath }) => {
+      writeFileSync(
+        configPath,
+        JSON.stringify({ models: { agents: { scout: { model: "vendor/alpha", thinking: "high" } } } }),
+      );
+      const before = readFileSync(configPath, "utf8");
+
+      const result = writeModelSelection({
+        agentName: "scout",
+        model: "vendor/alpha",
+        thinking: "high",
+        configPath,
+        examplePath,
+      });
+
+      assert.equal(result.changed, false);
+      assert.equal(readFileSync(configPath, "utf8"), before, "a no-op must not rewrite");
+    });
   });
 
   it("reads the legacy package config and migrates it on write", () => {
@@ -1364,7 +1594,7 @@ describe("config.ts", () => {
 
       const result = writeModelSelection({
         agentName: "worker",
-        value: "vendor/alpha",
+        model: "vendor/alpha",
         configPath,
         examplePath,
         legacyPath,
@@ -1427,13 +1657,13 @@ describe("config.ts", () => {
       // No config.json yet: it is created from the example.
       const first = writeModelSelection({
         agentName: "scout",
-        value: INHERIT_TOKEN,
+        model: INHERIT_TOKEN,
         configPath,
         examplePath,
       });
       const second = writeModelSelection({
         agentName: null,
-        value: "vendor/alpha",
+        model: "vendor/alpha",
         configPath,
         examplePath,
       });
@@ -1448,7 +1678,7 @@ describe("config.ts", () => {
       // Reset removes only the agent entry.
       const reset = writeModelSelection({
         agentName: "scout",
-        value: null,
+        model: null,
         configPath,
         examplePath,
       });
@@ -1470,7 +1700,7 @@ describe("config.ts", () => {
 
       const result = writeModelSelection({
         agentName: "scout",
-        value: "vendor/alpha",
+        model: "vendor/alpha",
         configPath,
         examplePath,
       });
@@ -1488,7 +1718,7 @@ describe("config.ts", () => {
         JSON.stringify({ models: { agents: { scout: { thinking: "high" } } } }, null, 2),
       );
 
-      writeModelSelection({ agentName: "scout", value: "vendor/alpha", configPath, examplePath });
+      writeModelSelection({ agentName: "scout", model: "vendor/alpha", configPath, examplePath });
 
       const parsed = JSON.parse(readFileSync(configPath, "utf8"));
       assert.deepEqual(parsed.models.agents.scout, { thinking: "high", model: "vendor/alpha" });
@@ -1504,7 +1734,7 @@ describe("config.ts", () => {
 
       const result = writeModelSelection({
         agentName: "scout",
-        value: null,
+        model: null,
         configPath,
         examplePath,
         legacyPath,
@@ -1531,7 +1761,7 @@ describe("config.ts", () => {
 
       const result = writeModelSelection({
         agentName: "scout",
-        value: null,
+        model: null,
         configPath,
         examplePath,
         legacyPath,
@@ -1551,7 +1781,7 @@ describe("config.ts", () => {
 
       const result = writeModelSelection({
         agentName: "scout",
-        value: null,
+        model: null,
         configPath,
         examplePath,
       });
@@ -1564,7 +1794,7 @@ describe("config.ts", () => {
   it("rejects an unsafe agent name before touching the filesystem", () => {
     withConfigFixture(({ configPath, examplePath }) => {
       assert.throws(
-        () => writeModelSelection({ agentName: "../escape", value: "inherit", configPath, examplePath }),
+        () => writeModelSelection({ agentName: "../escape", model: "inherit", configPath, examplePath }),
         /unsafe agent name/,
       );
       assert.equal(existsSync(configPath), false, "the guard must run before the write");
@@ -1575,7 +1805,7 @@ describe("config.ts", () => {
     withConfigFixture(({ configPath, examplePath }) => {
       writeFileSync(configPath, "{\n");
       assert.throws(
-        () => writeModelSelection({ agentName: "scout", value: "vendor/alpha", configPath, examplePath }),
+        () => writeModelSelection({ agentName: "scout", model: "vendor/alpha", configPath, examplePath }),
         /Invalid JSON in subagent config .*config\.json/,
       );
     });
