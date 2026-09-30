@@ -165,7 +165,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Model configuration
 
-A sub-agent model comes from the spawn `model` parameter, the `models` section of the subagent config, or the agent frontmatter, in that order. The `models` section is optional. Without it, models come from the agent frontmatter exactly as before.
+A sub-agent model comes from the per-agent `models` entry, the spawn `model` parameter, the `models` default, or the agent frontmatter, in that order. The `models` section is optional. Without it, models come from the agent frontmatter exactly as before. A per-agent entry is authoritative: the parent's `model` parameter cannot silently override the user's `/subagent-model` pick and instead produces a warning.
 
 The config lives at `<agent-dir>/subagents.json` (default `~/.pi/agent/subagents.json`), outside the package checkout, so a package update cannot delete it. A legacy package-root `config.json` is still read as a fallback until the next write migrates it.
 
@@ -197,8 +197,8 @@ Resolution order, first match wins:
 
 | Priority | Source |
 | -------- | ------ |
-| 1 | The `model` parameter on the spawn call. |
-| 2 | `models.agents["<name>"].model`. |
+| 1 | `models.agents["<name>"].model`. |
+| 2 | The `model` parameter on the spawn call. |
 | 3 | `models.default`. |
 | 4 | The `model:` field in the agent frontmatter. |
 | 5 | The pi session default, when no model applies. |

@@ -504,7 +504,17 @@ function resolveModelToken(input: ResolveInput): ResolvedModel {
   };
 }
 
-/** Pick the configured token and thinking level by precedence, then resolve. */
+/** Warning text when a spawn param is shadowed by the agent's authoritative config pick. */
+function buildIgnoredParamWarning(
+  param: string | null,
+  agentName: string | null,
+  configModel: string | undefined,
+): string | null {
+  if (!param || !agentName || !configModel || configModel === param) return null;
+  return `Ignoring model override "${param}" from the subagent tool: agent "${agentName}" is pinned to "${configModel}" via /subagent-model.`;
+}
+
+/** Pick the token by precedence: config-agent > param > config-default > agent, because the user's explicit `/subagent-model` pick is authoritative. */
 export function resolveSubagentModel(input: {
   param: string | null;
   agentName: string | null;
@@ -518,24 +528,34 @@ export function resolveSubagentModel(input: {
 
   const thinking = agentEntry?.thinking ?? models?.thinking ?? input.agentThinking ?? null;
 
-  // Highest precedence first; the first entry with a token wins. Config entries
-  // deliberately outrank the agent's own frontmatter, so a `models` entry can
-  // redirect an agent without editing its file.
+  // Highest precedence first; the first entry with a token wins. The per-agent
+  // config entry is authoritative, so a tool-supplied param cannot silently
+  // override the user's `/subagent-model` pick; config entries also outrank the
+  // agent's own frontmatter.
   const precedence: ReadonlyArray<{ source: ModelSource; token: string | null | undefined }> = [
-    { source: "param", token: input.param },
     { source: "config-agent", token: agentEntry?.model },
+    { source: "param", token: input.param },
     { source: "config-default", token: models?.default },
     { source: "agent", token: input.agentModel },
   ];
 
   const chosen = precedence.find((entry) => entry.token);
 
-  return resolveModelToken({
+  const resolved = resolveModelToken({
     ...input,
     token: chosen?.token ?? null,
     source: chosen?.source ?? "unset",
     thinking,
   });
+
+  const ignoredParamWarning = buildIgnoredParamWarning(input.param, input.agentName, agentEntry?.model);
+  if (ignoredParamWarning) {
+    resolved.warning = resolved.warning
+      ? `${resolved.warning}; ${ignoredParamWarning}`
+      : ignoredParamWarning;
+  }
+
+  return resolved;
 }
 
 /**

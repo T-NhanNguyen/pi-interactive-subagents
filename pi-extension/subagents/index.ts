@@ -1210,9 +1210,9 @@ function buildModelCatalog(ctx: ExtensionContext | undefined): ModelCatalog {
 }
 
 /**
- * Resolve a sub-agent's model: spawn parameter, then the config chain, then the
- * agent frontmatter. Throws when the resolved model is unusable and
- * `models.fallback` is `fail`.
+ * Resolve a sub-agent's model: the per-agent config pick, then the spawn
+ * parameter, then the config default, then the agent frontmatter. Throws when
+ * the resolved model is unusable and `models.fallback` is `fail`.
  */
 function resolveModelForSpawn(
   params: typeof SubagentParams.static,

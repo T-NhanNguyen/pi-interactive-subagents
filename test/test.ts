@@ -1149,7 +1149,7 @@ describe("config.ts", () => {
     assert.equal(isModelAvailable("vendor/other", available), false);
   });
 
-  it("resolves param before config, config before frontmatter", () => {
+  it("resolves config agent before param, config before frontmatter", () => {
     const config = parseSubagentConfig({
       models: {
         default: "vendor/beta",
@@ -1170,7 +1170,10 @@ describe("config.ts", () => {
       catalog,
     };
 
-    assert.equal(resolveSubagentModel({ ...base, param: "vendor/gamma" }).source, "param");
+    const pinned = resolveSubagentModel({ ...base, param: "vendor/gamma" });
+    assert.equal(pinned.source, "config-agent");
+    assert.equal(pinned.command, "vendor/alpha");
+
     assert.equal(resolveSubagentModel({ ...base, param: null }).source, "config-agent");
     assert.equal(resolveSubagentModel({ ...base, param: null }).command, "vendor/alpha");
 
@@ -1178,6 +1181,10 @@ describe("config.ts", () => {
     assert.equal(
       resolveSubagentModel({ ...base, config: noAgentEntry, param: null }).source,
       "config-default",
+    );
+    assert.equal(
+      resolveSubagentModel({ ...base, config: noAgentEntry, param: "vendor/gamma" }).source,
+      "param",
     );
 
     const noConfig = parseSubagentConfig({});
@@ -1189,6 +1196,36 @@ describe("config.ts", () => {
     const nothing = resolveSubagentModel({ ...base, agentModel: null, config: noConfig, param: null });
     assert.equal(nothing.source, "unset");
     assert.equal(nothing.command, null);
+  });
+
+  it("warns when a config-pinned agent ignores the spawn param", () => {
+    const config = parseSubagentConfig({
+      models: { agents: { scout: { model: "vendor/alpha" } } },
+    });
+    const catalog = makeCatalog(["vendor/alpha", "vendor/gamma"]);
+    const base = {
+      agentName: "scout",
+      agentModel: "vendor/from-file",
+      agentThinking: null,
+      config,
+      catalog,
+    };
+
+    const pinned = resolveSubagentModel({ ...base, param: "vendor/gamma" });
+    assert.equal(pinned.source, "config-agent");
+    assert.equal(pinned.token, "vendor/alpha");
+    assert.match(pinned.warning ?? "", /vendor\/gamma/);
+    assert.match(pinned.warning ?? "", /scout/);
+    assert.match(pinned.warning ?? "", /vendor\/alpha/);
+
+    const noAgentEntry = parseSubagentConfig({ models: { default: "vendor/beta" } });
+    const fromParam = resolveSubagentModel({ ...base, config: noAgentEntry, param: "vendor/gamma" });
+    assert.equal(fromParam.source, "param");
+    assert.equal(fromParam.warning, null);
+
+    const equal = resolveSubagentModel({ ...base, param: "vendor/alpha" });
+    assert.equal(equal.source, "config-agent");
+    assert.equal(equal.warning, null);
   });
 
   it("keeps the resolved command unchanged when no models section exists", () => {
